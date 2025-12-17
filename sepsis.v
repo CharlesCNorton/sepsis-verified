@@ -36,21 +36,91 @@ Record Vitals := {
   infection : bool   (* suspected/confirmed infection *)
 }.
 
+(** Time representation: minutes since presentation. *)
+Definition Time := nat.
+
 Record Therapy := {
-  fluids_on       : bool;
-  antibiotics_on  : bool;
-  pressor_low_on  : bool;
-  pressor_high_on : bool;
-  icu_transfer    : bool
+  fluids_on         : bool;
+  fluids_start_time : option Time;
+  antibiotics_on    : bool;
+  abx_start_time    : option Time;
+  pressor_low_on    : bool;
+  pressor_high_on   : bool;
+  icu_transfer      : bool
 }.
 
 Definition init_therapy : Therapy :=
-  {| fluids_on := false; antibiotics_on := false; pressor_low_on := false; pressor_high_on := false; icu_transfer := false |}.
+  {| fluids_on := false; fluids_start_time := None;
+     antibiotics_on := false; abx_start_time := None;
+     pressor_low_on := false; pressor_high_on := false;
+     icu_transfer := false |}.
 
 Record State := {
-  vit : Vitals;
-  th  : Therapy
+  vit          : Vitals;
+  th           : Therapy;
+  current_time : Time;
+  presentation_time : Time
 }.
+
+(** Time elapsed since presentation. *)
+Definition time_since_presentation (s : State) : Time :=
+  current_time s - presentation_time s.
+
+(** Sepsis-3 Hour-1 Bundle compliance windows (in minutes). *)
+Definition hour_1_window : Time := 60.
+Definition hour_3_window : Time := 180.
+Definition hour_6_window : Time := 360.
+
+(** Check if intervention was started within time window. *)
+Definition started_within (start : option Time) (deadline : Time) : bool :=
+  match start with
+  | None => false
+  | Some t => t <=? deadline
+  end.
+
+(** Hour-1 bundle: antibiotics and fluids started within 60 minutes. *)
+Definition hour1_bundle_compliant (s : State) : bool :=
+  let deadline := presentation_time s + hour_1_window in
+  started_within (abx_start_time (th s)) deadline &&
+  started_within (fluids_start_time (th s)) deadline.
+
+(** Reassessment due predicates. *)
+Definition reassessment_due_3hr (s : State) : bool :=
+  hour_3_window <=? time_since_presentation s.
+
+Definition reassessment_due_6hr (s : State) : bool :=
+  hour_6_window <=? time_since_presentation s.
+
+(** Time-related lemmas. *)
+Lemma started_within_monotone :
+  forall start t1 t2, t1 <= t2 -> started_within start t1 = true -> started_within start t2 = true.
+Proof.
+  intros start t1 t2 Hle Hstart.
+  unfold started_within in *.
+  destruct start as [t|].
+  - apply Nat.leb_le in Hstart.
+    apply Nat.leb_le.
+    lia.
+  - discriminate.
+Qed.
+
+Lemma bundle_compliance_preserved :
+  forall s t_extra,
+    hour1_bundle_compliant s = true ->
+    hour1_bundle_compliant {| vit := vit s;
+                              th := th s;
+                              current_time := current_time s + t_extra;
+                              presentation_time := presentation_time s |} = true.
+Proof.
+  intros s t_extra Hcomp.
+  unfold hour1_bundle_compliant in *.
+  simpl.
+  exact Hcomp.
+Qed.
+
+(** Helper to create State with default times (for time-independent lemmas). *)
+Definition make_state (v : Vitals) (t : Therapy) : State :=
+  {| vit := v; th := t; current_time := 0; presentation_time := 0 |}.
 
 (** Helpers *)
 Definition ge_bool x y := Nat.leb y x.
@@ -783,9 +853,9 @@ Proof.
     + assert (Hwge : map_mm w >= 70) by (apply Nat.ltb_ge; exact Hw). lia.
 Qed.
 
-Lemma sofa_monotone : forall v w t, worse_or_equal v w -> sofa {| vit := w; th := t |} >= sofa {| vit := v; th := t |}.
+Lemma sofa_monotone : forall v w t, worse_or_equal v w -> sofa (make_state w t) >= sofa (make_state v t).
 Proof.
-  intros v w t Hw; unfold sofa; simpl.
+  intros v w t Hw; unfold sofa, make_state; simpl.
   pose proof (resp_score_mono (v:=v) (w:=w) Hw) as Hr1.
   pose proof (coag_score_mono (v:=v) (w:=w) Hw) as Hr2.
   pose proof (liver_score_mono (v:=v) (w:=w) Hw) as Hr3.
@@ -834,22 +904,27 @@ Definition v_shock : Vitals :=
      gcs := 13; platelets := 90; bilir10 := 25; creat10 := 40; urine_ml_hr := 20;
      pao2 := 60; fio2_pct := 50; infection := true |}.
 
+Definition s_norm : State := make_state v_norm init_therapy.
+Definition s_shock : State := make_state v_shock init_therapy.
+
 Example decide_norm_monitor :
-  p_fluids (decide_plan {| vit := v_norm; th := init_therapy |}) = false /\
-  p_antibiotics (decide_plan {| vit := v_norm; th := init_therapy |}) = false /\
-  p_pressor_lo (decide_plan {| vit := v_norm; th := init_therapy |}) = false /\
-  p_pressor_hi (decide_plan {| vit := v_norm; th := init_therapy |}) = false /\
-  p_icu (decide_plan {| vit := v_norm; th := init_therapy |}) = false.
+  p_fluids (decide_plan s_norm) = false /\
+  p_antibiotics (decide_plan s_norm) = false /\
+  p_pressor_lo (decide_plan s_norm) = false /\
+  p_pressor_hi (decide_plan s_norm) = false /\
+  p_icu (decide_plan s_norm) = false.
 Proof. repeat split; reflexivity. Qed.
 
 Example decide_shock_escalates :
-  p_fluids (decide_plan {| vit := v_shock; th := init_therapy |}) = true /\
-  p_antibiotics (decide_plan {| vit := v_shock; th := init_therapy |}) = true /\
-  p_pressor_lo (decide_plan {| vit := v_shock; th := init_therapy |}) = true /\
-  p_pressor_hi (decide_plan {| vit := v_shock; th := init_therapy |}) = true /\
-  p_icu (decide_plan {| vit := v_shock; th := init_therapy |}) = true.
+  p_fluids (decide_plan s_shock) = true /\
+  p_antibiotics (decide_plan s_shock) = true /\
+  p_pressor_lo (decide_plan s_shock) = true /\
+  p_pressor_hi (decide_plan s_shock) = true /\
+  p_icu (decide_plan s_shock) = true.
 Proof. repeat split; reflexivity. Qed.
 
-Eval compute in sofa {| vit := v_norm; th := init_therapy |}.
-Eval compute in sofa {| vit := v_shock; th := init_therapy |}.
-Eval compute in decide_plan {| vit := v_shock; th := init_therapy |}.
+Example sofa_norm_is_2 : sofa s_norm = 2.
+Proof. reflexivity. Qed.
+
+Example sofa_shock_is_13 : sofa s_shock = 13.
+Proof. reflexivity. Qed.
