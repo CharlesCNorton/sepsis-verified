@@ -24,7 +24,7 @@ Record Vitals := {
   hr          : nat;   (* heart rate: beats per minute *)
   rr          : nat;   (* respiratory rate: breaths per minute *)
   sbp         : nat;   (* systolic blood pressure: mmHg *)
-  map_mm      : nat;   (* mean arterial pressure: mmHg *)
+  map_mmhg    : nat;   (* mean arterial pressure: mmHg *)
   lact10      : nat;   (* lactate: mmol/L × 10, e.g., 20 = 2.0 mmol/L *)
   gcs         : nat;   (* Glasgow Coma Scale: 3-15 *)
   platelets   : nat;   (* platelet count: ×10³/µL *)
@@ -68,6 +68,7 @@ Record Therapy := {
   dobutamine_on     : bool;  (* any dobutamine *)
   norepinephrine_mcg : nat;  (* norepinephrine dose: mcg/kg/min × 100 *)
   epinephrine_mcg   : nat;   (* epinephrine dose: mcg/kg/min × 100 *)
+  on_vent           : bool;  (* mechanical ventilation *)
   icu_transfer      : bool
 }.
 
@@ -76,7 +77,7 @@ Definition init_therapy : Therapy :=
      antibiotics_on := false; abx_start_time := None;
      dopamine_mcg := 0; dobutamine_on := false;
      norepinephrine_mcg := 0; epinephrine_mcg := 0;
-     icu_transfer := false |}.
+     on_vent := false; icu_transfer := false |}.
 
 (** Vasopressor categories per SOFA CV criteria. *)
 Definition on_low_dose_pressor (t : Therapy) : bool :=
@@ -187,35 +188,6 @@ Definition make_state (v : Vitals) (t : Therapy) : State :=
 Definition ge_bool x y := Nat.leb y x.
 Definition le_bool := Nat.leb.
 Definition max1 (n:nat) := if n =? 0 then 1 else n.
-
-(** Tiered scoring helpers (0/1/2) and (0/2) *)
-Definition tier_ge (x hi lo : nat) : nat :=
-  if ge_bool x hi then 2 else if ge_bool x lo then 1 else 0.
-
-Definition tier_map (m : nat) : nat :=
-  if le_bool m 65 then 2 else 0.
-
-Lemma tier_ge_mono : forall x y hi lo, x <= y -> tier_ge x hi lo <= tier_ge y hi lo.
-Proof.
-  intros x y hi lo Hxy.
-  unfold tier_ge, ge_bool.
-  destruct (Nat.leb lo x) eqn:Hxlo, (Nat.leb hi x) eqn:Hxhi;
-  destruct (Nat.leb lo y) eqn:Hylo, (Nat.leb hi y) eqn:Hyhi; try lia.
-  all: try (apply Nat.leb_le in Hxhi; apply Nat.leb_nle in Hyhi; lia).
-  all: try (apply Nat.leb_le in Hxlo; apply Nat.leb_nle in Hylo; lia).
-Qed.
-
-Lemma tier_map_mono : forall m1 m2, m2 <= m1 -> tier_map m2 >= tier_map m1.
-Proof.
-  intros m1 m2 Hle; unfold tier_map.
-  destruct (le_bool m1 65) eqn:Hm1.
-  - destruct (le_bool m2 65) eqn:Hm2.
-    + lia.
-    + apply Nat.leb_le in Hm1. apply Nat.leb_gt in Hm2. lia.
-  - destruct (le_bool m2 65) eqn:Hm2.
-    + apply Nat.leb_gt in Hm1. apply Nat.leb_le in Hm2. lia.
-    + lia.
-Qed.
 
 (** Generic threshold-based scoring with monotonicity. *)
 Fixpoint score_below_thresholds (v : nat) (thresholds : list (nat * nat)) : nat :=
@@ -391,25 +363,7 @@ Qed.
 Lemma resp_thresholds_decreasing : scores_decreasing resp_thresholds.
 Proof.
   unfold resp_thresholds.
-  simpl.
-  repeat split.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | Hin]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | Hin].
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    contradiction.
+  prove_scores_decreasing.
 Qed.
 
 (** P/F ratio calculation. FiO2 is given as percent (1-100), so the formula
@@ -420,8 +374,9 @@ Definition pf_ratio (pao2_val fio2_val : nat) : nat :=
   let fio2 := max1 fio2_val in
   (pao2_val * 100) / fio2.
 
-Definition resp_score (v:Vitals) : nat :=
-  resp_bucket (pf_ratio (pao2 v) (fio2_pct v)).
+Definition resp_score (v:Vitals) (t:Therapy) : nat :=
+  let raw := resp_bucket (pf_ratio (pao2 v) (fio2_pct v)) in
+  if on_vent t then raw else Nat.min raw 2.
 
 Definition coag_score_raw (p : nat) : nat :=
   if p <? 20 then 4
@@ -445,25 +400,7 @@ Qed.
 Lemma coag_thresholds_decreasing : scores_decreasing coag_thresholds.
 Proof.
   unfold coag_thresholds.
-  simpl.
-  repeat split.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | Hin]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | Hin].
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    contradiction.
+  prove_scores_decreasing.
 Qed.
 
 Lemma coag_score_raw_mono : forall p1 p2, p2 <= p1 -> coag_score_raw p2 >= coag_score_raw p1.
@@ -532,25 +469,7 @@ Qed.
 Lemma liver_thresholds_decreasing : scores_decreasing liver_thresholds.
 Proof.
   unfold liver_thresholds.
-  simpl.
-  repeat split.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | Hin]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | Hin].
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    contradiction.
+  prove_scores_decreasing.
 Qed.
 
 Lemma liver_score_raw_mono : forall b1 b2, b1 <= b2 -> liver_score_raw b2 >= liver_score_raw b1.
@@ -584,25 +503,7 @@ Qed.
 Lemma cns_thresholds_decreasing : scores_decreasing cns_thresholds.
 Proof.
   unfold cns_thresholds.
-  simpl.
-  repeat split.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | Hin]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | Hin].
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    contradiction.
+  prove_scores_decreasing.
 Qed.
 
 Lemma cns_score_raw_mono : forall g1 g2, g2 <= g1 -> cns_score_raw g2 >= cns_score_raw g1.
@@ -634,25 +535,7 @@ Qed.
 Lemma creat_thresholds_decreasing : scores_decreasing creat_thresholds.
 Proof.
   unfold creat_thresholds.
-  simpl.
-  repeat split.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | Hin]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | Hin].
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    contradiction.
+  prove_scores_decreasing.
 Qed.
 
 (** Urine output scoring per SOFA using 6-hour windows.
@@ -678,25 +561,7 @@ Qed.
 Lemma urine_thresholds_decreasing : scores_decreasing urine_thresholds.
 Proof.
   unfold urine_thresholds.
-  simpl.
-  repeat split.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | [Heq | Hin]].
-    + injection Heq; intros; lia.
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    destruct Hin as [Heq | Hin].
-    + injection Heq; intros; lia.
-    + contradiction.
-  - intros t' s' Hin.
-    contradiction.
+  prove_scores_decreasing.
 Qed.
 
 Definition renal_score (v:Vitals) : nat :=
@@ -707,11 +572,11 @@ Definition cv_score (v:Vitals) (t:Therapy) : nat :=
   if on_high_dose_pressor t then 4
   else if on_medium_dose_pressor t then 3
   else if on_low_dose_pressor t then 2
-  else if map_mm v <? 70 then 1
+  else if map_mmhg v <? 70 then 1
   else 0.
 
 Definition sofa (s:State) : nat :=
-  resp_score (vit s) +
+  resp_score (vit s) (th s) +
   coag_score (vit s) +
   liver_score (vit s) +
   cns_score (vit s) +
@@ -771,12 +636,12 @@ Definition sepsis (s:State) : bool :=
 Definition septic_shock (s:State) : bool :=
   infection (vit s) &&
   ge_bool (sofa s) 2 &&
-  (map_mm (vit s) <=? 65) &&
+  (map_mmhg (vit s) <=? 65) &&
   (ge_bool (lact10 (vit s)) 20).
 
 (** Witness: patient meeting all septic shock criteria. *)
 Definition v_shock_witness : Vitals :=
-  {| temp10 := 390; hr := 120; rr := 28; sbp := 80; map_mm := 60; lact10 := 25;
+  {| temp10 := 390; hr := 120; rr := 28; sbp := 80; map_mmhg := 60; lact10 := 25;
      gcs := 14; platelets := 80; bilir10 := 15; creat10 := 25; urine_ml_6hr := 30;
      pao2 := 70; fio2_pct := 40; infection := true; weight_kg := 70 |}.
 
@@ -789,7 +654,7 @@ Lemma septic_shock_witness_has_infection :
 Proof. reflexivity. Qed.
 
 Lemma septic_shock_witness_has_hypotension :
-  map_mm v_shock_witness <= 65.
+  map_mmhg v_shock_witness <= 65.
 Proof. simpl. lia. Qed.
 
 Lemma septic_shock_witness_has_elevated_lactate :
@@ -798,7 +663,7 @@ Proof. simpl. lia. Qed.
 
 (** Counterexample: high lactate and hypotension but NO infection => not septic shock. *)
 Definition v_not_septic : Vitals :=
-  {| temp10 := 390; hr := 120; rr := 28; sbp := 80; map_mm := 60; lact10 := 25;
+  {| temp10 := 390; hr := 120; rr := 28; sbp := 80; map_mmhg := 60; lact10 := 25;
      gcs := 14; platelets := 80; bilir10 := 15; creat10 := 25; urine_ml_6hr := 30;
      pao2 := 70; fio2_pct := 40; infection := false; weight_kg := 70 |}.
 
@@ -808,7 +673,7 @@ Proof. reflexivity. Qed.
 
 Lemma not_septic_counterexample_reason :
   infection v_not_septic = false /\
-  map_mm v_not_septic <= 65 /\
+  map_mmhg v_not_septic <= 65 /\
   lact10 v_not_septic >= 20.
 Proof.
   unfold v_not_septic.
@@ -834,16 +699,16 @@ Definition any_pressor (t : Therapy) : bool :=
 
 (** Clinical indications based purely on vitals (independent of current therapy). *)
 Definition fluids_indicated (v : Vitals) : bool :=
-  (map_mm v <=? 65) || (20 <=? lact10 v).
+  (map_mmhg v <=? 65) || (20 <=? lact10 v).
 
 Definition antibiotics_indicated (v : Vitals) : bool :=
   infection v.
 
 Definition pressor_indicated (v : Vitals) : bool :=
-  map_mm v <=? 65.
+  map_mmhg v <=? 65.
 
 Definition icu_indicated (v : Vitals) : bool :=
-  map_mm v <=? 60.
+  map_mmhg v <=? 60.
 
 (** Final plan: indication OR already receiving therapy (no de-escalation). *)
 Definition decide_plan (s:State) : Plan :=
@@ -861,7 +726,7 @@ Definition decide_plan (s:State) : Plan :=
      p_icu := icu |}.
 
 Lemma fluids_indicated_correct :
-  forall v, fluids_indicated v = true <-> map_mm v <= 65 \/ lact10 v >= 20.
+  forall v, fluids_indicated v = true <-> map_mmhg v <= 65 \/ lact10 v >= 20.
 Proof.
   intro v.
   unfold fluids_indicated.
@@ -906,7 +771,7 @@ Definition worse_or_equal (v w : Vitals) : Prop :=
   hr w >= hr v /\
   rr w >= rr v /\
   sbp w <= sbp v /\
-  map_mm w <= map_mm v /\
+  map_mmhg w <= map_mmhg v /\
   lact10 w >= lact10 v /\
   gcs w <= gcs v /\
   platelets w <= platelets v /\
@@ -925,9 +790,9 @@ Proof.
   - exact Hr.
 Qed.
 
-Lemma resp_score_mono : forall v w, worse_or_equal v w -> resp_score w >= resp_score v.
+Lemma resp_score_mono : forall v w t, worse_or_equal v w -> resp_score w t >= resp_score v t.
 Proof.
-  intros v w Hw.
+  intros v w t Hw.
   unfold worse_or_equal in Hw.
   destruct Hw as [Htemp [Hhr [Hrr [Hsbp [Hmap [Hlact [Hgcs [Hplt [Hbil [Hcre [Hur [Hpao2 Hfio2]]]]]]]]]]]].
   unfold resp_score, pf_ratio.
@@ -948,8 +813,13 @@ Proof.
   { unfold r1.
     apply Nat.Div0.div_le_mono.
     lia. }
-  apply resp_bucket_mono.
-  lia.
+  assert (Hbucket : resp_bucket r2 >= resp_bucket r1).
+  { apply resp_bucket_mono.
+    lia. }
+  destruct (on_vent t).
+  - exact Hbucket.
+  - apply Nat.min_le_compat_r.
+    exact Hbucket.
 Qed.
 
 Lemma coag_score_mono : forall v w, worse_or_equal v w -> coag_score w >= coag_score v.
@@ -1010,7 +880,7 @@ Proof.
   - eapply Nat.le_trans; [apply Hu | apply Nat.le_max_r].
 Qed.
 
-Lemma cv_score_mono : forall v w t, map_mm w <= map_mm v -> cv_score w t >= cv_score v t.
+Lemma cv_score_mono : forall v w t, map_mmhg w <= map_mmhg v -> cv_score w t >= cv_score v t.
 Proof.
   intros v w t Hm.
   unfold cv_score.
@@ -1020,18 +890,18 @@ Proof.
     + lia.
     + destruct (on_low_dose_pressor t).
       * lia.
-      * destruct (map_mm v <? 70) eqn:Hv.
+      * destruct (map_mmhg v <? 70) eqn:Hv.
         -- apply Nat.ltb_lt in Hv as Hvlt.
-           assert (Hwlt : map_mm w <? 70 = true).
+           assert (Hwlt : map_mmhg w <? 70 = true).
            { apply Nat.ltb_lt. lia. }
            rewrite Hwlt.
            lia.
-        -- assert (Hvge : map_mm v >= 70).
+        -- assert (Hvge : map_mmhg v >= 70).
            { apply Nat.ltb_ge. exact Hv. }
-           destruct (map_mm w <? 70) eqn:Hw.
+           destruct (map_mmhg w <? 70) eqn:Hw.
            ++ apply Nat.ltb_lt in Hw as Hwlt.
               lia.
-           ++ assert (Hwge : map_mm w >= 70).
+           ++ assert (Hwge : map_mmhg w >= 70).
               { apply Nat.ltb_ge. exact Hw. }
               lia.
 Qed.
@@ -1039,7 +909,7 @@ Qed.
 Lemma sofa_monotone : forall v w t, worse_or_equal v w -> sofa (make_state w t) >= sofa (make_state v t).
 Proof.
   intros v w t Hw; unfold sofa, make_state; simpl.
-  pose proof (resp_score_mono (v:=v) (w:=w) Hw) as Hr1.
+  pose proof (@resp_score_mono v w t Hw) as Hr1.
   pose proof (coag_score_mono (v:=v) (w:=w) Hw) as Hr2.
   pose proof (liver_score_mono (v:=v) (w:=w) Hw) as Hr3.
   pose proof (cns_score_mono (v:=v) (w:=w) Hw) as Hr4.
@@ -1061,7 +931,7 @@ Proof.
 Qed.
 
 Lemma plan_fluids_if_hypotension_or_lactate :
-  forall s, (map_mm (vit s) <= 65 \/ lact10 (vit s) >= 20) -> p_fluids (decide_plan s) = true.
+  forall s, (map_mmhg (vit s) <= 65 \/ lact10 (vit s) >= 20) -> p_fluids (decide_plan s) = true.
 Proof.
   intros s Hind.
   unfold decide_plan.
@@ -1089,12 +959,12 @@ Qed.
 
 (** Examples *)
 Definition v_norm : Vitals :=
-  {| temp10 := 370; hr := 72; rr := 14; sbp := 120; map_mm := 85; lact10 := 12;
+  {| temp10 := 370; hr := 72; rr := 14; sbp := 120; map_mmhg := 85; lact10 := 12;
      gcs := 15; platelets := 250; bilir10 := 8; creat10 := 10; urine_ml_6hr := 300;
      pao2 := 90; fio2_pct := 21; infection := false; weight_kg := 70 |}.
 
 Definition v_shock : Vitals :=
-  {| temp10 := 392; hr := 140; rr := 32; sbp := 85; map_mm := 55; lact10 := 45;
+  {| temp10 := 392; hr := 140; rr := 32; sbp := 85; map_mmhg := 55; lact10 := 45;
      gcs := 13; platelets := 90; bilir10 := 25; creat10 := 40; urine_ml_6hr := 30;
      pao2 := 60; fio2_pct := 50; infection := true; weight_kg := 70 |}.
 
@@ -1131,7 +1001,7 @@ Example fluid_complete_after_bolus :
               antibiotics_on := false; abx_start_time := None;
               dopamine_mcg := 0; dobutamine_on := false;
               norepinephrine_mcg := 0; epinephrine_mcg := 0;
-              icu_transfer := false |} in
+              on_vent := false; icu_transfer := false |} in
   fluid_resuscitation_complete v_norm t = true.
 Proof. reflexivity. Qed.
 
@@ -1140,6 +1010,6 @@ Example fluid_incomplete_partial :
               antibiotics_on := false; abx_start_time := None;
               dopamine_mcg := 0; dobutamine_on := false;
               norepinephrine_mcg := 0; epinephrine_mcg := 0;
-              icu_transfer := false |} in
+              on_vent := false; icu_transfer := false |} in
   fluid_resuscitation_complete v_norm t = false.
 Proof. reflexivity. Qed.
