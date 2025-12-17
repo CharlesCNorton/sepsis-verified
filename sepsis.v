@@ -14,7 +14,7 @@
 (*                                                                            *)
 (******************************************************************************)
 
-From Coq Require Import Bool Arith Lia.
+From Coq Require Import Bool Arith Lia List.
 
 Set Implicit Arguments.
 
@@ -86,7 +86,117 @@ Proof.
     + lia.
 Qed.
 
-(** SOFA organ subscores (0..4), simplified) *)
+(** Generic threshold-based scoring with monotonicity. *)
+Fixpoint score_below_thresholds (v : nat) (thresholds : list (nat * nat)) : nat :=
+  match thresholds with
+  | nil => 0
+  | (thresh, sc) :: rest =>
+      if v <? thresh then sc else score_below_thresholds v rest
+  end.
+
+Fixpoint scores_decreasing (ths : list (nat * nat)) : Prop :=
+  match ths with
+  | nil => True
+  | (_, s) :: rest =>
+      (forall t' s', In (t', s') rest -> s >= s') /\ scores_decreasing rest
+  end.
+
+Lemma score_below_bound (v : nat) (ths : list (nat * nat)) (t s : nat)
+  : scores_decreasing ((t, s) :: ths) -> score_below_thresholds v ths <= s.
+Proof.
+  intro Hdec.
+  simpl in Hdec.
+  destruct Hdec as [Hdom _].
+  induction ths as [| [t' s'] rest IH].
+  - simpl.
+    lia.
+  - simpl.
+    destruct (v <? t') eqn:E.
+    + assert (Hin : In (t', s') ((t', s') :: rest)) by (left; reflexivity).
+      specialize (Hdom t' s' Hin).
+      lia.
+    + apply IH.
+      intros t'' s'' Hin.
+      apply (Hdom t'' s'').
+      right.
+      exact Hin.
+Qed.
+
+Lemma score_below_mono (v1 v2 : nat) (ths : list (nat * nat))
+  : scores_decreasing ths -> v2 <= v1 -> score_below_thresholds v2 ths >= score_below_thresholds v1 ths.
+Proof.
+  intros Hdec Hle.
+  induction ths as [| [t s] rest IH].
+  - simpl.
+    lia.
+  - simpl.
+    destruct (v2 <? t) eqn:E2.
+    + destruct (v1 <? t) eqn:E1.
+      * lia.
+      * pose proof (@score_below_bound v1 rest t s Hdec) as Hb.
+        lia.
+    + destruct (v1 <? t) eqn:E1.
+      * apply Nat.ltb_lt in E1.
+        apply Nat.ltb_ge in E2.
+        lia.
+      * simpl in Hdec.
+        destruct Hdec as [_ Hrest].
+        apply IH.
+        exact Hrest.
+Qed.
+
+Fixpoint score_above_thresholds (v : nat) (thresholds : list (nat * nat)) : nat :=
+  match thresholds with
+  | nil => 0
+  | (thresh, sc) :: rest =>
+      if thresh <=? v then sc else score_above_thresholds v rest
+  end.
+
+Lemma score_above_bound (v : nat) (ths : list (nat * nat)) (t s : nat)
+  : scores_decreasing ((t, s) :: ths) -> score_above_thresholds v ths <= s.
+Proof.
+  intro Hdec.
+  simpl in Hdec.
+  destruct Hdec as [Hdom _].
+  induction ths as [| [t' s'] rest IH].
+  - simpl.
+    lia.
+  - simpl.
+    destruct (t' <=? v) eqn:E.
+    + assert (Hin : In (t', s') ((t', s') :: rest)) by (left; reflexivity).
+      specialize (Hdom t' s' Hin).
+      lia.
+    + apply IH.
+      intros t'' s'' Hin.
+      apply (Hdom t'' s'').
+      right.
+      exact Hin.
+Qed.
+
+Lemma score_above_mono (v1 v2 : nat) (ths : list (nat * nat))
+  : scores_decreasing ths -> v1 <= v2 -> score_above_thresholds v2 ths >= score_above_thresholds v1 ths.
+Proof.
+  intros Hdec Hle.
+  induction ths as [| [t s] rest IH].
+  - simpl.
+    lia.
+  - simpl.
+    destruct (t <=? v2) eqn:E2.
+    + destruct (t <=? v1) eqn:E1.
+      * lia.
+      * pose proof (@score_above_bound v1 rest t s Hdec) as Hb.
+        lia.
+    + destruct (t <=? v1) eqn:E1.
+      * apply Nat.leb_le in E1.
+        apply Nat.leb_gt in E2.
+        lia.
+      * simpl in Hdec.
+        destruct Hdec as [_ Hrest].
+        apply IH.
+        exact Hrest.
+Qed.
+
+(** SOFA organ subscores (0..4), simplified. *)
 Definition resp_bucket (ratio:nat) : nat :=
   if ratio <=? 100 then 4
   else if ratio <=? 200 then 3
@@ -94,33 +204,266 @@ Definition resp_bucket (ratio:nat) : nat :=
   else if ratio <=? 400 then 1
   else 0.
 
+Definition resp_thresholds : list (nat * nat) :=
+  (101, 4) :: (201, 3) :: (301, 2) :: (401, 1) :: nil.
+
+Lemma resp_bucket_eq : forall r, resp_bucket r = score_below_thresholds r resp_thresholds.
+Proof.
+  intro r.
+  unfold resp_bucket, resp_thresholds, score_below_thresholds.
+  destruct (r <=? 100) eqn:E100.
+  - apply Nat.leb_le in E100.
+    assert (r <? 101 = true) by (apply Nat.ltb_lt; lia).
+    rewrite H.
+    reflexivity.
+  - apply Nat.leb_gt in E100.
+    assert (r <? 101 = false) by (apply Nat.ltb_ge; lia).
+    rewrite H.
+    destruct (r <=? 200) eqn:E200.
+    + apply Nat.leb_le in E200.
+      assert (r <? 201 = true) by (apply Nat.ltb_lt; lia).
+      rewrite H0.
+      reflexivity.
+    + apply Nat.leb_gt in E200.
+      assert (r <? 201 = false) by (apply Nat.ltb_ge; lia).
+      rewrite H0.
+      destruct (r <=? 300) eqn:E300.
+      * apply Nat.leb_le in E300.
+        assert (r <? 301 = true) by (apply Nat.ltb_lt; lia).
+        rewrite H1.
+        reflexivity.
+      * apply Nat.leb_gt in E300.
+        assert (r <? 301 = false) by (apply Nat.ltb_ge; lia).
+        rewrite H1.
+        destruct (r <=? 400) eqn:E400.
+        -- apply Nat.leb_le in E400.
+           assert (r <? 401 = true) by (apply Nat.ltb_lt; lia).
+           rewrite H2.
+           reflexivity.
+        -- apply Nat.leb_gt in E400.
+           assert (r <? 401 = false) by (apply Nat.ltb_ge; lia).
+           rewrite H2.
+           reflexivity.
+Qed.
+
+Lemma resp_thresholds_decreasing : scores_decreasing resp_thresholds.
+Proof.
+  unfold resp_thresholds.
+  simpl.
+  repeat split.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | Hin]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | Hin].
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    contradiction.
+Qed.
+
 Definition resp_score (v:Vitals) : nat :=
   let fio2 := max1 (fio2_pct v) in
   resp_bucket ((pao2 v * 100) / fio2).
 
-Definition coag_score (v:Vitals) : nat :=
-  let p := platelets v in
+Definition coag_score_raw (p : nat) : nat :=
   if p <? 20 then 4
   else if p <? 50 then 3
   else if p <? 100 then 2
   else if p <? 150 then 1
   else 0.
 
-Definition liver_score (v:Vitals) : nat :=
-  let b := bilir10 v in
+Definition coag_score (v:Vitals) : nat := coag_score_raw (platelets v).
+
+Definition coag_thresholds : list (nat * nat) :=
+  (20, 4) :: (50, 3) :: (100, 2) :: (150, 1) :: nil.
+
+Lemma coag_score_raw_eq : forall p, coag_score_raw p = score_below_thresholds p coag_thresholds.
+Proof.
+  intro p.
+  unfold coag_score_raw, coag_thresholds, score_below_thresholds.
+  reflexivity.
+Qed.
+
+Lemma coag_thresholds_decreasing : scores_decreasing coag_thresholds.
+Proof.
+  unfold coag_thresholds.
+  simpl.
+  repeat split.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | Hin]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | Hin].
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    contradiction.
+Qed.
+
+Lemma coag_score_raw_mono : forall p1 p2, p2 <= p1 -> coag_score_raw p2 >= coag_score_raw p1.
+Proof.
+  intros p1 p2 Hp.
+  rewrite !coag_score_raw_eq.
+  apply score_below_mono.
+  - exact coag_thresholds_decreasing.
+  - exact Hp.
+Qed.
+
+Definition liver_score_raw (b : nat) : nat :=
   if b <? 12 then 0
   else if b <? 20 then 1
   else if b <? 60 then 2
   else if b <? 120 then 3
   else 4.
 
-Definition cns_score (v:Vitals) : nat :=
-  let g := gcs v in
+Definition liver_score (v:Vitals) : nat := liver_score_raw (bilir10 v).
+
+Definition liver_thresholds : list (nat * nat) :=
+  (120, 4) :: (60, 3) :: (20, 2) :: (12, 1) :: nil.
+
+Lemma liver_score_raw_eq : forall b, liver_score_raw b = score_above_thresholds b liver_thresholds.
+Proof.
+  intro b.
+  unfold liver_score_raw, liver_thresholds, score_above_thresholds.
+  destruct (b <? 12) eqn:E12.
+  - apply Nat.ltb_lt in E12.
+    assert (120 <=? b = false) by (apply Nat.leb_gt; lia).
+    assert (60 <=? b = false) by (apply Nat.leb_gt; lia).
+    assert (20 <=? b = false) by (apply Nat.leb_gt; lia).
+    assert (12 <=? b = false) by (apply Nat.leb_gt; lia).
+    rewrite H, H0, H1, H2.
+    reflexivity.
+  - apply Nat.ltb_ge in E12.
+    destruct (b <? 20) eqn:E20.
+    + apply Nat.ltb_lt in E20.
+      assert (120 <=? b = false) by (apply Nat.leb_gt; lia).
+      assert (60 <=? b = false) by (apply Nat.leb_gt; lia).
+      assert (20 <=? b = false) by (apply Nat.leb_gt; lia).
+      assert (12 <=? b = true) by (apply Nat.leb_le; lia).
+      rewrite H, H0, H1, H2.
+      reflexivity.
+    + apply Nat.ltb_ge in E20.
+      destruct (b <? 60) eqn:E60.
+      * apply Nat.ltb_lt in E60.
+        assert (120 <=? b = false) by (apply Nat.leb_gt; lia).
+        assert (60 <=? b = false) by (apply Nat.leb_gt; lia).
+        assert (20 <=? b = true) by (apply Nat.leb_le; lia).
+        rewrite H, H0, H1.
+        reflexivity.
+      * apply Nat.ltb_ge in E60.
+        destruct (b <? 120) eqn:E120.
+        -- apply Nat.ltb_lt in E120.
+           assert (120 <=? b = false) by (apply Nat.leb_gt; lia).
+           assert (60 <=? b = true) by (apply Nat.leb_le; lia).
+           rewrite H, H0.
+           reflexivity.
+        -- apply Nat.ltb_ge in E120.
+           assert (120 <=? b = true) by (apply Nat.leb_le; lia).
+           rewrite H.
+           reflexivity.
+Qed.
+
+Lemma liver_thresholds_decreasing : scores_decreasing liver_thresholds.
+Proof.
+  unfold liver_thresholds.
+  simpl.
+  repeat split.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | Hin]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | Hin].
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    contradiction.
+Qed.
+
+Lemma liver_score_raw_mono : forall b1 b2, b1 <= b2 -> liver_score_raw b2 >= liver_score_raw b1.
+Proof.
+  intros b1 b2 Hb.
+  rewrite !liver_score_raw_eq.
+  apply score_above_mono.
+  - exact liver_thresholds_decreasing.
+  - exact Hb.
+Qed.
+
+Definition cns_score_raw (g : nat) : nat :=
   if g <? 6 then 4
   else if g <? 10 then 3
   else if g <? 13 then 2
   else if g <? 15 then 1
   else 0.
+
+Definition cns_score (v:Vitals) : nat := cns_score_raw (gcs v).
+
+Definition cns_thresholds : list (nat * nat) :=
+  (6, 4) :: (10, 3) :: (13, 2) :: (15, 1) :: nil.
+
+Lemma cns_score_raw_eq : forall g, cns_score_raw g = score_below_thresholds g cns_thresholds.
+Proof.
+  intro g.
+  unfold cns_score_raw, cns_thresholds, score_below_thresholds.
+  reflexivity.
+Qed.
+
+Lemma cns_thresholds_decreasing : scores_decreasing cns_thresholds.
+Proof.
+  unfold cns_thresholds.
+  simpl.
+  repeat split.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | Hin]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | Hin].
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    contradiction.
+Qed.
+
+Lemma cns_score_raw_mono : forall g1 g2, g2 <= g1 -> cns_score_raw g2 >= cns_score_raw g1.
+Proof.
+  intros g1 g2 Hg.
+  rewrite !cns_score_raw_eq.
+  apply score_below_mono.
+  - exact cns_thresholds_decreasing.
+  - exact Hg.
+Qed.
 
 Definition creat_score (c:nat) : nat :=
   if ge_bool c 53 then 4
@@ -129,12 +472,112 @@ Definition creat_score (c:nat) : nat :=
   else if ge_bool c 11 then 1
   else 0.
 
+Definition creat_thresholds : list (nat * nat) :=
+  (53, 4) :: (34, 3) :: (21, 2) :: (11, 1) :: nil.
+
+Lemma creat_score_eq : forall c, creat_score c = score_above_thresholds c creat_thresholds.
+Proof.
+  intro c.
+  unfold creat_score, creat_thresholds, score_above_thresholds, ge_bool.
+  reflexivity.
+Qed.
+
+Lemma creat_thresholds_decreasing : scores_decreasing creat_thresholds.
+Proof.
+  unfold creat_thresholds.
+  simpl.
+  repeat split.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | Hin]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | Hin].
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    contradiction.
+Qed.
+
 Definition urine_score (u:nat) : nat :=
   if u <=? 20 then 4
   else if u <=? 50 then 3
   else if u <=? 120 then 2
   else if u <=? 200 then 1
   else 0.
+
+Definition urine_thresholds : list (nat * nat) :=
+  (21, 4) :: (51, 3) :: (121, 2) :: (201, 1) :: nil.
+
+Lemma urine_score_eq : forall u, urine_score u = score_below_thresholds u urine_thresholds.
+Proof.
+  intro u.
+  unfold urine_score, urine_thresholds, score_below_thresholds.
+  destruct (u <=? 20) eqn:E20.
+  - apply Nat.leb_le in E20.
+    assert (u <? 21 = true) by (apply Nat.ltb_lt; lia).
+    rewrite H.
+    reflexivity.
+  - apply Nat.leb_gt in E20.
+    assert (u <? 21 = false) by (apply Nat.ltb_ge; lia).
+    rewrite H.
+    destruct (u <=? 50) eqn:E50.
+    + apply Nat.leb_le in E50.
+      assert (u <? 51 = true) by (apply Nat.ltb_lt; lia).
+      rewrite H0.
+      reflexivity.
+    + apply Nat.leb_gt in E50.
+      assert (u <? 51 = false) by (apply Nat.ltb_ge; lia).
+      rewrite H0.
+      destruct (u <=? 120) eqn:E120.
+      * apply Nat.leb_le in E120.
+        assert (u <? 121 = true) by (apply Nat.ltb_lt; lia).
+        rewrite H1.
+        reflexivity.
+      * apply Nat.leb_gt in E120.
+        assert (u <? 121 = false) by (apply Nat.ltb_ge; lia).
+        rewrite H1.
+        destruct (u <=? 200) eqn:E200.
+        -- apply Nat.leb_le in E200.
+           assert (u <? 201 = true) by (apply Nat.ltb_lt; lia).
+           rewrite H2.
+           reflexivity.
+        -- apply Nat.leb_gt in E200.
+           assert (u <? 201 = false) by (apply Nat.ltb_ge; lia).
+           rewrite H2.
+           reflexivity.
+Qed.
+
+Lemma urine_thresholds_decreasing : scores_decreasing urine_thresholds.
+Proof.
+  unfold urine_thresholds.
+  simpl.
+  repeat split.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | [Heq | Hin]]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | [Heq | Hin]].
+    + injection Heq; intros; lia.
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    destruct Hin as [Heq | Hin].
+    + injection Heq; intros; lia.
+    + contradiction.
+  - intros t' s' Hin.
+    contradiction.
+Qed.
 
 Definition renal_score (v:Vitals) : nat :=
   Nat.max (creat_score (creat10 v)) (urine_score (urine_ml_hr v)).
@@ -239,62 +682,10 @@ Definition worse_or_equal (v w : Vitals) : Prop :=
 Lemma resp_bucket_mono : forall r1 r2, r2 <= r1 -> resp_bucket r2 >= resp_bucket r1.
 Proof.
   intros r1 r2 Hr.
-  unfold resp_bucket.
-  destruct (le_lt_dec r1 100) as [H1|H1].
-  - assert (E1 : r1 <=? 100 = true) by (apply Nat.leb_le; lia).
-    assert (E2 : r2 <=? 100 = true) by (apply Nat.leb_le; lia).
-    rewrite E1, E2. lia.
-  - destruct (le_lt_dec r1 200) as [H2|H2].
-    + assert (E100 : r1 <=? 100 = false) by (apply Nat.leb_gt; lia).
-      assert (E200 : r1 <=? 200 = true) by (apply Nat.leb_le; lia).
-      destruct (le_lt_dec r2 100) as [Hr2a|Hr2a].
-      * assert (E2 : r2 <=? 100 = true) by (apply Nat.leb_le; lia).
-        rewrite E100, E200, E2. lia.
-      * assert (E2_100 : r2 <=? 100 = false) by (apply Nat.leb_gt; lia).
-        assert (E2_200 : r2 <=? 200 = true) by (apply Nat.leb_le; lia).
-        rewrite E100, E200, E2_100, E2_200. lia.
-    + destruct (le_lt_dec r1 300) as [H3|H3].
-      * assert (E100 : r1 <=? 100 = false) by (apply Nat.leb_gt; lia).
-        assert (E200 : r1 <=? 200 = false) by (apply Nat.leb_gt; lia).
-        assert (E300 : r1 <=? 300 = true) by (apply Nat.leb_le; lia).
-        destruct (le_lt_dec r2 200) as [Hr2b|Hr2b].
-        -- destruct (le_lt_dec r2 100) as [Hr2c|Hr2c].
-           ++ assert (E2_100 : r2 <=? 100 = true) by (apply Nat.leb_le; lia).
-              rewrite E100, E200, E300, E2_100. lia.
-           ++ assert (E2_100 : r2 <=? 100 = false) by (apply Nat.leb_gt; lia).
-              assert (E2_200 : r2 <=? 200 = true) by (apply Nat.leb_le; lia).
-              rewrite E100, E200, E300, E2_100, E2_200. lia.
-        -- assert (E2_100 : r2 <=? 100 = false) by (apply Nat.leb_gt; lia).
-           assert (E2_200 : r2 <=? 200 = false) by (apply Nat.leb_gt; lia).
-           assert (E2_300 : r2 <=? 300 = true) by (apply Nat.leb_le; lia).
-           rewrite E100, E200, E300, E2_100, E2_200, E2_300. lia.
-      * destruct (le_lt_dec r1 400) as [H4|H4].
-        -- assert (E100 : r1 <=? 100 = false) by (apply Nat.leb_gt; lia).
-           assert (E200 : r1 <=? 200 = false) by (apply Nat.leb_gt; lia).
-           assert (E300 : r1 <=? 300 = false) by (apply Nat.leb_gt; lia).
-           assert (E400 : r1 <=? 400 = true) by (apply Nat.leb_le; lia).
-           destruct (le_lt_dec r2 300) as [Hr2c|Hr2c].
-               ++ destruct (le_lt_dec r2 200) as [Hr2d|Hr2d].
-                  ** destruct (le_lt_dec r2 100) as [Hr2e|Hr2e].
-                     --- assert (E2_100 : r2 <=? 100 = true) by (apply Nat.leb_le; lia).
-                         rewrite E100, E200, E300, E400, E2_100. lia.
-                  --- assert (E2_100 : r2 <=? 100 = false) by (apply Nat.leb_gt; lia).
-                      assert (E2_200 : r2 <=? 200 = true) by (apply Nat.leb_le; lia).
-                      rewrite E100, E200, E300, E400, E2_100, E2_200. lia.
-               ** assert (E2_100 : r2 <=? 100 = false) by (apply Nat.leb_gt; lia).
-                  assert (E2_200 : r2 <=? 200 = false) by (apply Nat.leb_gt; lia).
-                  assert (E2_300 : r2 <=? 300 = true) by (apply Nat.leb_le; lia).
-                 rewrite E100, E200, E300, E400, E2_100, E2_200, E2_300. lia.
-           ++ assert (E2_100 : r2 <=? 100 = false) by (apply Nat.leb_gt; lia).
-              assert (E2_200 : r2 <=? 200 = false) by (apply Nat.leb_gt; lia).
-              assert (E2_300 : r2 <=? 300 = false) by (apply Nat.leb_gt; lia).
-              assert (E2_400 : r2 <=? 400 = true) by (apply Nat.leb_le; lia).
-              rewrite E100, E200, E300, E400, E2_100, E2_200, E2_300, E2_400. lia.
-        -- assert (E100 : r1 <=? 100 = false) by (apply Nat.leb_gt; lia).
-           assert (E200 : r1 <=? 200 = false) by (apply Nat.leb_gt; lia).
-           assert (E300 : r1 <=? 300 = false) by (apply Nat.leb_gt; lia).
-           assert (E400 : r1 <=? 400 = false) by (apply Nat.leb_gt; lia).
-           rewrite E100, E200, E300, E400. lia.
+  rewrite !resp_bucket_eq.
+  apply score_below_mono.
+  - exact resp_thresholds_decreasing.
+  - exact Hr.
 Qed.
 
 Lemma resp_score_mono : forall v w, worse_or_equal v w -> resp_score w >= resp_score v.
@@ -322,326 +713,47 @@ Qed.
 
 Lemma coag_score_mono : forall v w, worse_or_equal v w -> coag_score w >= coag_score v.
 Proof.
-  intros v w Hw; unfold coag_score.
-  destruct Hw as [_ [_ [_ [_ [_ [_ [_ [Hplt [_ [_ [_ _]]]]]]]]]]].
-  set (pv := platelets v) in *.
-  set (pw := platelets w) in *.
-  assert (Hpwle : pw <= pv) by lia.
-  clear Hplt.
-  clearbody pv pw.
-  destruct (lt_dec pv 20) as [Hp20|Hp20].
-  - assert (Epv20 : pv <? 20 = true) by (apply Nat.ltb_lt; lia).
-    assert (Epw20 : pw <? 20 = true) by (apply Nat.ltb_lt; lia).
-    rewrite Epv20, Epw20. lia.
-  - assert (Epv20 : pv <? 20 = false) by (apply Nat.ltb_ge; lia).
-    destruct (lt_dec pv 50) as [Hp50|Hp50].
-    + assert (Epv50 : pv <? 50 = true) by (apply Nat.ltb_lt; lia).
-      rewrite Epv20, Epv50.
-      destruct (lt_dec pw 20) as [Hw20|Hw20].
-      * assert (Epw20 : pw <? 20 = true) by (apply Nat.ltb_lt; lia).
-        rewrite Epw20. lia.
-      * assert (Epw20 : pw <? 20 = false) by (apply Nat.ltb_ge; lia).
-        assert (Epw50 : pw <? 50 = true) by (apply Nat.ltb_lt; lia).
-        rewrite Epw20, Epw50. lia.
-    + assert (Epv50 : pv <? 50 = false) by (apply Nat.ltb_ge; lia).
-      destruct (lt_dec pv 100) as [Hp100|Hp100].
-      * assert (Epv100 : pv <? 100 = true) by (apply Nat.ltb_lt; lia).
-        rewrite Epv20, Epv50, Epv100.
-        destruct (lt_dec pw 50) as [Hw50|Hw50].
-        -- destruct (lt_dec pw 20) as [Hw20|Hw20].
-           ++ assert (Epw20 : pw <? 20 = true) by (apply Nat.ltb_lt; lia).
-              rewrite Epw20. lia.
-           ++ assert (Epw20 : pw <? 20 = false) by (apply Nat.ltb_ge; lia).
-              assert (Epw50 : pw <? 50 = true) by (apply Nat.ltb_lt; lia).
-              rewrite Epw20, Epw50. lia.
-        -- assert (Epw50 : pw <? 50 = false) by (apply Nat.ltb_ge; lia).
-           assert (Epw20 : pw <? 20 = false) by (apply Nat.ltb_ge; lia).
-           assert (Epw100 : pw <? 100 = true) by (apply Nat.ltb_lt; lia).
-           rewrite Epw20, Epw50, Epw100. lia.
-      * assert (Epv100 : pv <? 100 = false) by (apply Nat.ltb_ge; lia).
-        destruct (lt_dec pv 150) as [Hp150|Hp150].
-        -- assert (Epv150 : pv <? 150 = true) by (apply Nat.ltb_lt; lia).
-           rewrite Epv20, Epv50, Epv100, Epv150.
-           destruct (lt_dec pw 100) as [Hw100|Hw100].
-           ++ destruct (lt_dec pw 50) as [Hw50|Hw50].
-              ** destruct (lt_dec pw 20) as [Hw20|Hw20].
-                 --- assert (Epw20 : pw <? 20 = true) by (apply Nat.ltb_lt; lia).
-                     rewrite Epw20. lia.
-                 --- assert (Epw20 : pw <? 20 = false) by (apply Nat.ltb_ge; lia).
-                     assert (Epw50 : pw <? 50 = true) by (apply Nat.ltb_lt; lia).
-                     rewrite Epw20, Epw50. lia.
-              ** assert (Epw50 : pw <? 50 = false) by (apply Nat.ltb_ge; lia).
-                 assert (Epw20 : pw <? 20 = false) by (apply Nat.ltb_ge; lia).
-                 assert (Epw100 : pw <? 100 = true) by (apply Nat.ltb_lt; lia).
-                 rewrite Epw20, Epw50, Epw100. lia.
-           ++ assert (Epw100 : pw <? 100 = false) by (apply Nat.ltb_ge; lia).
-              assert (Epw50 : pw <? 50 = false) by (apply Nat.ltb_ge; lia).
-              assert (Epw20 : pw <? 20 = false) by (apply Nat.ltb_ge; lia).
-              assert (Epw150 : pw <? 150 = true) by (apply Nat.ltb_lt; lia).
-              rewrite Epw20, Epw50, Epw100, Epw150. lia.
-        -- assert (Epv150 : pv <? 150 = false) by (apply Nat.ltb_ge; lia).
-           rewrite Epv20, Epv50, Epv100, Epv150. lia.
+  intros v w Hw.
+  unfold coag_score.
+  apply coag_score_raw_mono.
+  destruct Hw as [_ [_ [_ [_ [_ [_ [_ [Hplt _]]]]]]]].
+  lia.
 Qed.
 
 Lemma liver_score_mono : forall v w, worse_or_equal v w -> liver_score w >= liver_score v.
 Proof.
-  intros v w Hw; unfold liver_score.
-  destruct Hw as [_ [_ [_ [_ [_ [_ [_ [_ [Hbil [_ [_ [_ _]]]]]]]]]]]].
-  set (bv := bilir10 v) in *.
-  set (bw := bilir10 w) in *.
-  assert (Hge : bw >= bv) by lia.
-  clear Hbil; clearbody bv bw.
-  destruct (lt_dec bv 12) as [Hv12|Hv12].
-  - assert (E12v : bv <? 12 = true) by (apply Nat.ltb_lt; lia).
-    rewrite E12v. lia.
-  - assert (Hv12ge : bv >= 12) by lia.
-    destruct (lt_dec bv 20) as [Hv20|Hv20].
-    + assert (E12v : bv <? 12 = false) by (apply Nat.ltb_ge; lia).
-      assert (E20v : bv <? 20 = true) by (apply Nat.ltb_lt; lia).
-      rewrite E12v, E20v.
-      assert (E12w : bw <? 12 = false) by (apply Nat.ltb_ge; lia).
-      rewrite E12w.
-      destruct (bw <? 20) eqn:E20w.
-      * apply Nat.ltb_lt in E20w. lia.
-      * apply Nat.ltb_ge in E20w.
-        destruct (bw <? 60) eqn:E60w.
-        -- apply Nat.ltb_lt in E60w. lia.
-        -- apply Nat.ltb_ge in E60w.
-           destruct (bw <? 120) eqn:E120w.
-           ++ apply Nat.ltb_lt in E120w. lia.
-           ++ apply Nat.ltb_ge in E120w. lia.
-    + assert (Hv20ge : bv >= 20) by lia.
-      destruct (lt_dec bv 60) as [Hv60|Hv60].
-      * assert (E12v : bv <? 12 = false) by (apply Nat.ltb_ge; lia).
-        assert (E20v : bv <? 20 = false) by (apply Nat.ltb_ge; lia).
-        assert (E60v : bv <? 60 = true) by (apply Nat.ltb_lt; lia).
-        rewrite E12v, E20v, E60v.
-        assert (E12w : bw <? 12 = false) by (apply Nat.ltb_ge; lia).
-        assert (E20w : bw <? 20 = false) by (apply Nat.ltb_ge; lia).
-        rewrite E12w, E20w.
-        destruct (bw <? 60) eqn:E60w.
-        -- apply Nat.ltb_lt in E60w. lia.
-        -- apply Nat.ltb_ge in E60w.
-           destruct (bw <? 120) eqn:E120w.
-           ++ apply Nat.ltb_lt in E120w. lia.
-           ++ apply Nat.ltb_ge in E120w. lia.
-      * assert (Hv60ge : bv >= 60) by lia.
-        destruct (lt_dec bv 120) as [Hv120|Hv120].
-        -- assert (E12v : bv <? 12 = false) by (apply Nat.ltb_ge; lia).
-           assert (E20v : bv <? 20 = false) by (apply Nat.ltb_ge; lia).
-           assert (E60v : bv <? 60 = false) by (apply Nat.ltb_ge; lia).
-           assert (E120v : bv <? 120 = true) by (apply Nat.ltb_lt; lia).
-           rewrite E12v, E20v, E60v, E120v.
-           assert (E12w : bw <? 12 = false) by (apply Nat.ltb_ge; lia).
-           assert (E20w : bw <? 20 = false) by (apply Nat.ltb_ge; lia).
-           assert (E60w : bw <? 60 = false) by (apply Nat.ltb_ge; lia).
-           rewrite E12w, E20w, E60w.
-           destruct (bw <? 120) eqn:E120w.
-           ++ apply Nat.ltb_lt in E120w. lia.
-           ++ apply Nat.ltb_ge in E120w. lia.
-        -- assert (E12v : bv <? 12 = false) by (apply Nat.ltb_ge; lia).
-           assert (E20v : bv <? 20 = false) by (apply Nat.ltb_ge; lia).
-           assert (E60v : bv <? 60 = false) by (apply Nat.ltb_ge; lia).
-           assert (E120v : bv <? 120 = false) by (apply Nat.ltb_ge; lia).
-           rewrite E12v, E20v, E60v, E120v.
-           assert (E12w : bw <? 12 = false) by (apply Nat.ltb_ge; lia).
-           assert (E20w : bw <? 20 = false) by (apply Nat.ltb_ge; lia).
-           assert (E60w : bw <? 60 = false) by (apply Nat.ltb_ge; lia).
-           assert (E120w : bw <? 120 = false) by (apply Nat.ltb_ge; lia).
-           rewrite E12w, E20w, E60w, E120w. lia.
+  intros v w Hw.
+  unfold liver_score.
+  apply liver_score_raw_mono.
+  destruct Hw as [_ [_ [_ [_ [_ [_ [_ [_ [Hbil _]]]]]]]]].
+  lia.
 Qed.
-
 
 Lemma cns_score_mono : forall v w, worse_or_equal v w -> cns_score w >= cns_score v.
 Proof.
-  intros v w Hw; unfold cns_score.
-  destruct Hw as [Htemp [Hhr [Hrr [Hsbp [Hmap [Hlact [Hgcs [Hplt [Hbil [Hcre [Hur [Hpao2 Hfio2]]]]]]]]]]]].
-  set (gv := gcs v) in *.
-  set (gw := gcs w) in *.
-  assert (Hgwle : gw <= gv) by lia.
-  clear Htemp Hhr Hrr Hsbp Hmap Hlact Hplt Hbil Hcre Hur Hpao2 Hfio2.
-  clearbody gv gw.
-  destruct (lt_dec gv 6) as [Hv6|Hv6].
-  - assert (Egv6 : gv <? 6 = true) by (apply Nat.ltb_lt; lia).
-    assert (Egw6 : gw <? 6 = true) by (apply Nat.ltb_lt; lia).
-    rewrite Egw6, Egv6. lia.
-  - assert (Egv6 : gv <? 6 = false) by (apply Nat.ltb_ge; lia).
-    destruct (lt_dec gv 10) as [Hv10|Hv10].
-    + assert (Egv10 : gv <? 10 = true) by (apply Nat.ltb_lt; lia).
-      rewrite Egv6, Egv10.
-      destruct (lt_dec gw 6) as [Hw6|Hw6].
-      * assert (Egw6 : gw <? 6 = true) by (apply Nat.ltb_lt; lia).
-        rewrite Egw6. lia.
-      * assert (Egw6 : gw <? 6 = false) by (apply Nat.ltb_ge; lia).
-        assert (Egw10 : gw <? 10 = true) by (apply Nat.ltb_lt; lia).
-        rewrite Egw6, Egw10. lia.
-    + assert (Hv10ge : gv >= 10) by lia.
-      destruct (lt_dec gv 13) as [Hv13|Hv13].
-      * assert (Egv10 : gv <? 10 = false) by (apply Nat.ltb_ge; lia).
-        assert (Egv13 : gv <? 13 = true) by (apply Nat.ltb_lt; lia).
-        rewrite Egv6, Egv10, Egv13.
-        destruct (lt_dec gw 10) as [Hw10|Hw10].
-        -- destruct (lt_dec gw 6) as [Hw6|Hw6].
-           ++ assert (Egw6 : gw <? 6 = true) by (apply Nat.ltb_lt; lia).
-              rewrite Egw6. lia.
-           ++ assert (Egw6 : gw <? 6 = false) by (apply Nat.ltb_ge; lia).
-              assert (Egw10 : gw <? 10 = true) by (apply Nat.ltb_lt; lia).
-              rewrite Egw6, Egw10. lia.
-        -- assert (Egw6 : gw <? 6 = false) by (apply Nat.ltb_ge; lia).
-           assert (Egw10 : gw <? 10 = false) by (apply Nat.ltb_ge; lia).
-           assert (Egw13 : gw <? 13 = true) by (apply Nat.ltb_lt; lia).
-           rewrite Egw6, Egw10, Egw13. lia.
-      * assert (Hv13ge : gv >= 13) by lia.
-        destruct (lt_dec gv 15) as [Hv15|Hv15].
-        -- assert (Egv10 : gv <? 10 = false) by (apply Nat.ltb_ge; lia).
-           assert (Egv13 : gv <? 13 = false) by (apply Nat.ltb_ge; lia).
-           assert (Egv15 : gv <? 15 = true) by (apply Nat.ltb_lt; lia).
-           rewrite Egv6, Egv10, Egv13, Egv15.
-           destruct (lt_dec gw 13) as [Hw13|Hw13].
-           ++ destruct (lt_dec gw 10) as [Hw10|Hw10].
-              ** destruct (lt_dec gw 6) as [Hw6|Hw6].
-                 --- assert (Egw6 : gw <? 6 = true) by (apply Nat.ltb_lt; lia).
-                     rewrite Egw6. lia.
-                 --- assert (Egw6 : gw <? 6 = false) by (apply Nat.ltb_ge; lia).
-                     assert (Egw10 : gw <? 10 = true) by (apply Nat.ltb_lt; lia).
-                     rewrite Egw6, Egw10. lia.
-              ** assert (Egw6 : gw <? 6 = false) by (apply Nat.ltb_ge; lia).
-                 assert (Egw10 : gw <? 10 = false) by (apply Nat.ltb_ge; lia).
-                 assert (Egw13 : gw <? 13 = true) by (apply Nat.ltb_lt; lia).
-                 rewrite Egw6, Egw10, Egw13. lia.
-           ++ assert (Egw6 : gw <? 6 = false) by (apply Nat.ltb_ge; lia).
-              assert (Egw10 : gw <? 10 = false) by (apply Nat.ltb_ge; lia).
-              assert (Egw13 : gw <? 13 = false) by (apply Nat.ltb_ge; lia).
-              assert (Egw15 : gw <? 15 = true) by (apply Nat.ltb_lt; lia).
-              rewrite Egw6, Egw10, Egw13, Egw15. lia.
-        -- assert (Egv10 : gv <? 10 = false) by (apply Nat.ltb_ge; lia).
-           assert (Egv13 : gv <? 13 = false) by (apply Nat.ltb_ge; lia).
-           assert (Egv15 : gv <? 15 = false) by (apply Nat.ltb_ge; lia).
-           rewrite Egv6, Egv10, Egv13, Egv15. lia.
+  intros v w Hw.
+  unfold cns_score.
+  apply cns_score_raw_mono.
+  destruct Hw as [_ [_ [_ [_ [_ [_ [Hgcs _]]]]]]].
+  lia.
 Qed.
-
 
 Lemma creat_score_mono : forall c1 c2, c1 <= c2 -> creat_score c2 >= creat_score c1.
 Proof.
-  intros c1 c2 Hle; unfold creat_score, ge_bool.
-  destruct (lt_dec c1 11) as [H11|H11].
-  - assert (Ec1_53 : 53 <=? c1 = false) by (apply Nat.leb_gt; lia).
-    assert (Ec1_34 : 34 <=? c1 = false) by (apply Nat.leb_gt; lia).
-    assert (Ec1_21 : 21 <=? c1 = false) by (apply Nat.leb_gt; lia).
-    assert (Ec1_11 : 11 <=? c1 = false) by (apply Nat.leb_gt; lia).
-    rewrite Ec1_53, Ec1_34, Ec1_21, Ec1_11. lia.
-  - assert (H11ge : c1 >= 11) by lia.
-    destruct (lt_dec c1 21) as [H21|H21].
-    + assert (Ec1_53 : 53 <=? c1 = false) by (apply Nat.leb_gt; lia).
-      assert (Ec1_34 : 34 <=? c1 = false) by (apply Nat.leb_gt; lia).
-      assert (Ec1_21 : 21 <=? c1 = false) by (apply Nat.leb_gt; lia).
-      assert (Ec1_11 : 11 <=? c1 = true) by (apply Nat.leb_le; lia).
-      rewrite Ec1_53, Ec1_34, Ec1_21, Ec1_11.
-      destruct (lt_dec c2 21) as [Hc2_21|Hc2_21].
-      * assert (Ec2_53 : 53 <=? c2 = false) by (apply Nat.leb_gt; lia).
-        assert (Ec2_34 : 34 <=? c2 = false) by (apply Nat.leb_gt; lia).
-        assert (Ec2_21 : 21 <=? c2 = false) by (apply Nat.leb_gt; lia).
-        assert (Ec2_11 : 11 <=? c2 = true) by (apply Nat.leb_le; lia).
-        rewrite Ec2_53, Ec2_34, Ec2_21, Ec2_11. lia.
-      * destruct (lt_dec c2 34) as [Hc2_34|Hc2_34].
-        -- assert (Ec2_53 : 53 <=? c2 = false) by (apply Nat.leb_gt; lia).
-           assert (Ec2_34 : 34 <=? c2 = false) by (apply Nat.leb_gt; lia).
-           assert (Ec2_21 : 21 <=? c2 = true) by (apply Nat.leb_le; lia).
-           rewrite Ec2_53, Ec2_34, Ec2_21. lia.
-        -- destruct (lt_dec c2 53) as [Hc2_53|Hc2_53].
-           ++ assert (Ec2_53 : 53 <=? c2 = false) by (apply Nat.leb_gt; lia).
-              assert (Ec2_34 : 34 <=? c2 = true) by (apply Nat.leb_le; lia).
-              rewrite Ec2_53, Ec2_34. lia.
-           ++ assert (Ec2_53 : 53 <=? c2 = true) by (apply Nat.leb_le; lia).
-              rewrite Ec2_53. lia.
-    + assert (H21ge : c1 >= 21) by lia.
-      destruct (lt_dec c1 34) as [H34|H34].
-      * assert (Ec1_53 : 53 <=? c1 = false) by (apply Nat.leb_gt; lia).
-        assert (Ec1_34 : 34 <=? c1 = false) by (apply Nat.leb_gt; lia).
-        assert (Ec1_21 : 21 <=? c1 = true) by (apply Nat.leb_le; lia).
-        rewrite Ec1_53, Ec1_34, Ec1_21.
-        destruct (lt_dec c2 34) as [Hc2_34|Hc2_34].
-        -- assert (Ec2_53 : 53 <=? c2 = false) by (apply Nat.leb_gt; lia).
-           assert (Ec2_34 : 34 <=? c2 = false) by (apply Nat.leb_gt; lia).
-           assert (Ec2_21 : 21 <=? c2 = true) by (apply Nat.leb_le; lia).
-           rewrite Ec2_53, Ec2_34, Ec2_21. lia.
-        -- destruct (lt_dec c2 53) as [Hc2_53|Hc2_53].
-           ++ assert (Ec2_53 : 53 <=? c2 = false) by (apply Nat.leb_gt; lia).
-              assert (Ec2_34 : 34 <=? c2 = true) by (apply Nat.leb_le; lia).
-              rewrite Ec2_53, Ec2_34. lia.
-           ++ assert (Ec2_53 : 53 <=? c2 = true) by (apply Nat.leb_le; lia).
-              rewrite Ec2_53. lia.
-      * assert (H34ge : c1 >= 34) by lia.
-        destruct (lt_dec c1 53) as [H53|H53].
-        -- assert (Ec1_53 : 53 <=? c1 = false) by (apply Nat.leb_gt; lia).
-           assert (Ec1_34 : 34 <=? c1 = true) by (apply Nat.leb_le; lia).
-           rewrite Ec1_53, Ec1_34.
-           destruct (lt_dec c2 53) as [Hc2_53|Hc2_53].
-           ++ assert (Ec2_53 : 53 <=? c2 = false) by (apply Nat.leb_gt; lia).
-              assert (Ec2_34 : 34 <=? c2 = true) by (apply Nat.leb_le; lia).
-              rewrite Ec2_53, Ec2_34. lia.
-           ++ assert (Ec2_53 : 53 <=? c2 = true) by (apply Nat.leb_le; lia).
-              rewrite Ec2_53. lia.
-        -- assert (Ec1_53 : 53 <=? c1 = true) by (apply Nat.leb_le; lia).
-           assert (Ec2_53 : 53 <=? c2 = true) by (apply Nat.leb_le; lia).
-           rewrite Ec1_53, Ec2_53. lia.
+  intros c1 c2 Hle.
+  rewrite !creat_score_eq.
+  apply score_above_mono.
+  - exact creat_thresholds_decreasing.
+  - exact Hle.
 Qed.
 
 Lemma urine_score_mono : forall u1 u2, u2 <= u1 -> urine_score u2 >= urine_score u1.
 Proof.
-  intros u1 u2 Hle; unfold urine_score.
-  destruct (le_lt_dec u1 20) as [Hu20|Hu20].
-  - assert (Eu1_20 : u1 <=? 20 = true) by (apply Nat.leb_le; lia).
-    assert (Eu2_20 : u2 <=? 20 = true) by (apply Nat.leb_le; lia).
-    rewrite Eu1_20, Eu2_20. lia.
-  - assert (Eu1_20 : u1 <=? 20 = false) by (apply Nat.leb_gt; lia).
-    destruct (le_lt_dec u1 50) as [Hu50|Hu50].
-    + assert (Eu1_50 : u1 <=? 50 = true) by (apply Nat.leb_le; lia).
-      rewrite Eu1_20, Eu1_50.
-      destruct (le_lt_dec u2 20) as [Hu2_20|Hu2_20].
-      * assert (Eu2_20 : u2 <=? 20 = true) by (apply Nat.leb_le; lia).
-        rewrite Eu2_20. lia.
-      * assert (Eu2_20 : u2 <=? 20 = false) by (apply Nat.leb_gt; lia).
-        assert (Eu2_50 : u2 <=? 50 = true) by (apply Nat.leb_le; lia).
-        rewrite Eu2_20, Eu2_50. lia.
-    + assert (Eu1_50 : u1 <=? 50 = false) by (apply Nat.leb_gt; lia).
-      destruct (le_lt_dec u1 120) as [Hu120|Hu120].
-      * assert (Eu1_120 : u1 <=? 120 = true) by (apply Nat.leb_le; lia).
-        rewrite Eu1_20, Eu1_50, Eu1_120.
-        destruct (le_lt_dec u2 50) as [Hu2_50|Hu2_50].
-        -- destruct (le_lt_dec u2 20) as [Hu2_20|Hu2_20].
-           ++ assert (Eu2_20 : u2 <=? 20 = true) by (apply Nat.leb_le; lia).
-              rewrite Eu2_20. lia.
-           ++ assert (Eu2_20 : u2 <=? 20 = false) by (apply Nat.leb_gt; lia).
-              assert (Eu2_50 : u2 <=? 50 = true) by (apply Nat.leb_le; lia).
-              rewrite Eu2_20, Eu2_50. lia.
-        -- assert (Eu2_50 : u2 <=? 50 = false) by (apply Nat.leb_gt; lia).
-           assert (Eu2_120 : u2 <=? 120 = true) by (apply Nat.leb_le; lia).
-           assert (Eu2_20 : u2 <=? 20 = false) by (apply Nat.leb_gt; lia).
-           rewrite Eu2_20, Eu2_50, Eu2_120. lia.
-      * assert (Eu1_120 : u1 <=? 120 = false) by (apply Nat.leb_gt; lia).
-        destruct (le_lt_dec u1 200) as [Hu200|Hu200].
-        -- assert (Eu1_200 : u1 <=? 200 = true) by (apply Nat.leb_le; lia).
-           rewrite Eu1_20, Eu1_50, Eu1_120, Eu1_200.
-           destruct (le_lt_dec u2 120) as [Hu2_120|Hu2_120].
-           ++ destruct (le_lt_dec u2 50) as [Hu2_50|Hu2_50].
-              ** destruct (le_lt_dec u2 20) as [Hu2_20|Hu2_20].
-                 --- assert (Eu2_20 : u2 <=? 20 = true) by (apply Nat.leb_le; lia).
-                     rewrite Eu2_20. lia.
-                 --- assert (Eu2_20 : u2 <=? 20 = false) by (apply Nat.leb_gt; lia).
-                     assert (Eu2_50 : u2 <=? 50 = true) by (apply Nat.leb_le; lia).
-                     rewrite Eu2_20, Eu2_50. lia.
-              ** assert (Eu2_50 : u2 <=? 50 = false) by (apply Nat.leb_gt; lia).
-                 assert (Eu2_120 : u2 <=? 120 = true) by (apply Nat.leb_le; lia).
-                 assert (Eu2_20 : u2 <=? 20 = false) by (apply Nat.leb_gt; lia).
-                 rewrite Eu2_20, Eu2_50, Eu2_120. lia.
-           ++ assert (Eu2_120 : u2 <=? 120 = false) by (apply Nat.leb_gt; lia).
-              assert (Eu2_200 : u2 <=? 200 = true) by (apply Nat.leb_le; lia).
-              assert (Eu2_50 : u2 <=? 50 = false) by (apply Nat.leb_gt; lia).
-              assert (Eu2_20 : u2 <=? 20 = false) by (apply Nat.leb_gt; lia).
-              rewrite Eu2_20, Eu2_50, Eu2_120, Eu2_200. lia.
-        -- assert (Eu1_200 : u1 <=? 200 = false) by (apply Nat.leb_gt; lia).
-           rewrite Eu1_20, Eu1_50, Eu1_120, Eu1_200. lia.
+  intros u1 u2 Hle.
+  rewrite !urine_score_eq.
+  apply score_below_mono.
+  - exact urine_thresholds_decreasing.
+  - exact Hle.
 Qed.
 
 Lemma renal_score_mono : forall v w, worse_or_equal v w -> renal_score w >= renal_score v.
