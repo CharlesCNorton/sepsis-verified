@@ -681,6 +681,19 @@ Proof.
   lia.
 Qed.
 
+Lemma septic_shock_implies_sepsis :
+  forall s, septic_shock s = true -> sepsis s = true.
+Proof.
+  intros s Hshock.
+  unfold septic_shock in Hshock.
+  unfold sepsis.
+  apply andb_prop in Hshock as [H1 _].
+  apply andb_prop in H1 as [H2 _].
+  apply andb_prop in H2 as [Hinf Hsofa].
+  rewrite Hinf, Hsofa.
+  reflexivity.
+Qed.
+
 (** Plan/decision: deterministic escalation policy *)
 Record Plan := {
   p_fluids      : bool;
