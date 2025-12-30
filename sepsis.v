@@ -14,9 +14,77 @@
 (*                                                                            *)
 (******************************************************************************)
 
+(** TODO: Remaining improvements.
+
+    Structural changes:
+    - Add SpO2 (oxygen saturation) parameter and scoring.
+    - Add supplemental oxygen tracking for NEWS calculation.
+    - Complete NEWS implementation (missing SpO2 subscores).
+    - Add handling for missing data (all fields currently required).
+
+    Proof refactoring:
+    - Refactor resp_bucket_eq (37 lines of repetitive case analysis).
+    - Refactor liver_score_raw_eq (40 lines, similarly verbose).
+    - Refactor decide_plan_monotone (120 lines of nested case splits).
+    - Replace manual boolean destructuring with btauto where possible.
+    - Abstract repeated patterns (e.g., apply Nat.leb_le chains).
+
+    Missing proofs:
+    - Make determinism/totality proofs meaningful (model as relation).
+    - Connect plan logic to SOFA/qSOFA/NEWS scores (currently dead code).
+    - Prove valid vitals always produce valid scores.
+    - Prove counterexample is tight (all criteria except infection).
+    - Prove SOFA ranges correspond to clinical severity tiers.
+    - Prove qSOFA >= 2 implies further workup indicated.
+    - Add "adequately treated" predicate (bundle compliance + resuscitation).
+
+    Clinical features:
+    - Add culture collection documentation before antibiotics.
+    - Add lactate clearance tracking (repeat lactate if initial >2).
+    - Add mechanical ventilation settings (PEEP, FiO2 targets).
+    - Add fluid responsiveness assessment (passive leg raise, PPV).
+    - Add vasopressor titration guidance beyond binary low/medium/high.
+    - Add source control indication (antibiotics broad vs narrow spectrum).
+    - Add time-series modeling (trends, rate of change).
+    - Add uncertainty/confidence intervals on measurements.
+    - Add liveness property (treatment leads to improvement).
+    - Add de-escalation logic (protocol currently only escalates).
+*)
+
 From Coq Require Import Bool Arith Lia List.
 
 Set Implicit Arguments.
+
+(** Infection source classification. *)
+Inductive InfectionSource :=
+  | SourcePulmonary
+  | SourceAbdominal
+  | SourceUrinary
+  | SourceSkinSoftTissue
+  | SourceCNS
+  | SourceCardiovascular
+  | SourceBone
+  | SourceOther
+  | SourceUnknown.
+
+(** Infection status with severity and source. *)
+Inductive InfectionStatus :=
+  | NoInfection
+  | Suspected (source : InfectionSource)
+  | Confirmed (source : InfectionSource).
+
+Definition infection_present (i : InfectionStatus) : bool :=
+  match i with
+  | NoInfection => false
+  | Suspected _ => true
+  | Confirmed _ => true
+  end.
+
+Definition infection_confirmed (i : InfectionStatus) : bool :=
+  match i with
+  | Confirmed _ => true
+  | _ => false
+  end.
 
 (** Vital signs and labs, discretized. *)
 Record Vitals := {
@@ -33,8 +101,9 @@ Record Vitals := {
   urine_ml_6hr : nat;  (* urine output: mL in last 6 hours (SOFA standard window) *)
   pao2        : nat;   (* arterial O2 pressure: mmHg *)
   fio2_pct    : nat;   (* fraction inspired O2: percent 1-100 *)
-  infection   : bool;  (* suspected or confirmed infection *)
-  weight_kg   : nat    (* patient weight: kilograms *)
+  infection   : bool;  (* suspected or confirmed infection - legacy field *)
+  weight_kg   : nat;   (* patient weight: kilograms *)
+  infection_info : InfectionStatus  (* detailed infection status *)
 }.
 
 (** GCS validity: must be in range [3,15]. *)
@@ -78,6 +147,27 @@ Definition init_therapy : Therapy :=
      dopamine_mcg := 0; dobutamine_on := false;
      norepinephrine_mcg := 0; epinephrine_mcg := 0;
      on_vent := false; icu_transfer := false |}.
+
+(** Therapy consistency: if active, must have start time; if start time, must be active. *)
+Definition therapy_valid (t : Therapy) : Prop :=
+  (fluids_on t = true <-> fluids_start_time t <> None) /\
+  (antibiotics_on t = true <-> abx_start_time t <> None) /\
+  (fluids_ml t > 0 -> fluids_on t = true) /\
+  (dopamine_mcg t > 0 \/ dobutamine_on t = true \/
+   norepinephrine_mcg t > 0 \/ epinephrine_mcg t > 0 -> fluids_on t = true).
+
+Lemma init_therapy_valid : therapy_valid init_therapy.
+Proof.
+  unfold therapy_valid, init_therapy.
+  simpl.
+  repeat split.
+  - intro H. discriminate.
+  - intro H. destruct H. reflexivity.
+  - intro H. discriminate.
+  - intro H. destruct H. reflexivity.
+  - lia.
+  - intro H. destruct H as [H|[H|[H|H]]]; lia.
+Qed.
 
 (** Vasopressor categories per SOFA CV criteria.
     Thresholds use encoded values from Therapy record:
@@ -159,27 +249,93 @@ Record State := {
   presentation_time : Time
 }.
 
-(** Time elapsed since presentation. *)
+(** State temporal validity: current time must be at or after presentation. *)
+Definition state_time_valid (s : State) : bool :=
+  presentation_time s <=? current_time s.
+
+Lemma state_time_valid_iff : forall s,
+  state_time_valid s = true <-> presentation_time s <= current_time s.
+Proof.
+  intro s.
+  unfold state_time_valid.
+  split.
+  - apply Nat.leb_le.
+  - apply Nat.leb_le.
+Qed.
+
+(** Time elapsed since presentation. Requires state_time_valid for meaningful result. *)
 Definition time_since_presentation (s : State) : Time :=
   current_time s - presentation_time s.
+
+Lemma time_since_presentation_correct : forall s,
+  state_time_valid s = true ->
+  time_since_presentation s + presentation_time s = current_time s.
+Proof.
+  intros s Hv.
+  apply state_time_valid_iff in Hv.
+  unfold time_since_presentation.
+  lia.
+Qed.
 
 (** Sepsis-3 Hour-1 Bundle compliance windows (in minutes). *)
 Definition hour_1_window : Time := 60.
 Definition hour_3_window : Time := 180.
 Definition hour_6_window : Time := 360.
 
-(** Check if intervention was started within time window. *)
-Definition started_within (start : option Time) (deadline : Time) : bool :=
+(** SSC Hour-1 Bundle elements tracking.
+    Full bundle: (1) measure lactate, (2) obtain blood cultures before abx,
+    (3) administer broad-spectrum antibiotics, (4) begin fluids for hypotension/lactate≥4,
+    (5) apply vasopressors if hypotensive during/after fluids to maintain MAP≥65,
+    (6) remeasure lactate if initial >2 mmol/L. *)
+Record BundleCompliance := {
+  lactate_measured_time    : option Time;
+  blood_cultures_time      : option Time;
+  lactate_remeasured_time  : option Time;
+  initial_lactate_elevated : bool
+}.
+
+Definition init_bundle : BundleCompliance :=
+  {| lactate_measured_time := None;
+     blood_cultures_time := None;
+     lactate_remeasured_time := None;
+     initial_lactate_elevated := false |}.
+
+(** Check if intervention was started within time window [earliest, deadline]. *)
+Definition started_within (start : option Time) (earliest deadline : Time) : bool :=
   match start with
   | None => false
-  | Some t => t <=? deadline
+  | Some t => (earliest <=? t) && (t <=? deadline)
   end.
 
-(** Hour-1 bundle: antibiotics and fluids started within 60 minutes. *)
-Definition hour1_bundle_compliant (s : State) : bool :=
-  let deadline := presentation_time s + hour_1_window in
-  started_within (abx_start_time (th s)) deadline &&
-  started_within (fluids_start_time (th s)) deadline.
+(** Hour-1 bundle partial compliance: antibiotics and fluids started within 60 minutes.
+    This checks only elements 3 and 4 of the full SSC Hour-1 bundle. *)
+Definition hour1_bundle_partial (s : State) : bool :=
+  let pres := presentation_time s in
+  let deadline := pres + hour_1_window in
+  started_within (abx_start_time (th s)) pres deadline &&
+  started_within (fluids_start_time (th s)) pres deadline.
+
+(** Full SSC Hour-1 bundle compliance.
+    Requires: lactate measured, blood cultures before abx, abx within 1hr,
+    fluids if indicated, vasopressors if needed, lactate remeasured if elevated. *)
+Definition hour1_bundle_full (s : State) (b : BundleCompliance) : bool :=
+  let pres := presentation_time s in
+  let deadline := pres + hour_1_window in
+  started_within (lactate_measured_time b) pres deadline &&
+  match blood_cultures_time b, abx_start_time (th s) with
+  | Some bc, Some abx => bc <=? abx
+  | _, _ => false
+  end &&
+  started_within (abx_start_time (th s)) pres deadline &&
+  started_within (fluids_start_time (th s)) pres deadline &&
+  (negb (initial_lactate_elevated b) ||
+   match lactate_remeasured_time b with
+   | Some _ => true
+   | None => false
+   end).
+
+(** Backward compatibility alias. *)
+Definition hour1_bundle_compliant := hour1_bundle_partial.
 
 (** Reassessment due predicates. *)
 Definition reassessment_due_3hr (s : State) : bool :=
@@ -190,22 +346,44 @@ Definition reassessment_due_6hr (s : State) : bool :=
 
 (** Time-related lemmas. *)
 Lemma started_within_monotone :
-  forall start t1 t2, t1 <= t2 -> started_within start t1 = true -> started_within start t2 = true.
+  forall start e1 e2 d1 d2,
+    e2 <= e1 -> d1 <= d2 ->
+    started_within start e1 d1 = true -> started_within start e2 d2 = true.
 Proof.
-  intros start t1 t2 Hle Hstart.
+  intros start e1 e2 d1 d2 Helo Hdhi Hstart.
   unfold started_within in *.
   destruct start as [t|].
-  - apply Nat.leb_le in Hstart.
-    apply Nat.leb_le.
-    lia.
+  - apply andb_prop in Hstart as [Hlo Hhi].
+    apply Nat.leb_le in Hlo.
+    apply Nat.leb_le in Hhi.
+    apply andb_true_intro.
+    split.
+    + apply Nat.leb_le. lia.
+    + apply Nat.leb_le. lia.
   - discriminate.
+Qed.
+
+Lemma started_within_bounds :
+  forall start earliest deadline t,
+    start = Some t -> started_within start earliest deadline = true ->
+    earliest <= t /\ t <= deadline.
+Proof.
+  intros start earliest deadline t Hsome Hwithin.
+  rewrite Hsome in Hwithin.
+  unfold started_within in Hwithin.
+  apply andb_prop in Hwithin as [Hlo Hhi].
+  apply Nat.leb_le in Hlo.
+  apply Nat.leb_le in Hhi.
+  lia.
 Qed.
 
 Lemma bundle_compliant_implies_started :
   forall s, hour1_bundle_compliant s = true ->
     exists t_abx t_flu,
       abx_start_time (th s) = Some t_abx /\
-      fluids_start_time (th s) = Some t_flu.
+      fluids_start_time (th s) = Some t_flu /\
+      presentation_time s <= t_abx /\
+      presentation_time s <= t_flu.
 Proof.
   intros s Hcomp.
   unfold hour1_bundle_compliant in Hcomp.
@@ -213,8 +391,12 @@ Proof.
   unfold started_within in *.
   destruct (abx_start_time (th s)) as [t_abx|] eqn:Ea.
   - destruct (fluids_start_time (th s)) as [t_flu|] eqn:Ef.
-    + exists t_abx, t_flu.
-      split; reflexivity.
+    + apply andb_prop in Habx as [Habx_lo Habx_hi].
+      apply andb_prop in Hflu as [Hflu_lo Hflu_hi].
+      apply Nat.leb_le in Habx_lo.
+      apply Nat.leb_le in Hflu_lo.
+      exists t_abx, t_flu.
+      repeat split; try reflexivity; lia.
     + discriminate.
   - discriminate.
 Qed.
@@ -240,7 +422,6 @@ Definition make_state (v : Vitals) (t : Therapy) : State :=
 (** Helpers *)
 Definition ge_bool x y := Nat.leb y x.
 Definition le_bool := Nat.leb.
-Definition max1 (n:nat) := if n =? 0 then 1 else n.
 
 (** Generic threshold-based scoring with monotonicity. *)
 Fixpoint score_below_thresholds (v : nat) (thresholds : list (nat * nat)) : nat :=
@@ -255,6 +436,46 @@ Fixpoint scores_decreasing (ths : list (nat * nat)) : Prop :=
   | nil => True
   | (_, s) :: rest =>
       (forall t' s', In (t', s') rest -> s >= s') /\ scores_decreasing rest
+  end.
+
+Fixpoint thresholds_strictly_increasing (ths : list (nat * nat)) : Prop :=
+  match ths with
+  | nil => True
+  | (t, _) :: rest =>
+      (forall t' s', In (t', s') rest -> t < t') /\ thresholds_strictly_increasing rest
+  end.
+
+Fixpoint thresholds_strictly_decreasing (ths : list (nat * nat)) : Prop :=
+  match ths with
+  | nil => True
+  | (t, _) :: rest =>
+      (forall t' s', In (t', s') rest -> t > t') /\ thresholds_strictly_decreasing rest
+  end.
+
+Definition well_formed_below_table (ths : list (nat * nat)) : Prop :=
+  scores_decreasing ths /\ thresholds_strictly_increasing ths.
+
+Definition well_formed_above_table (ths : list (nat * nat)) : Prop :=
+  scores_decreasing ths /\ thresholds_strictly_decreasing ths.
+
+Ltac prove_thresholds_increasing :=
+  simpl;
+  repeat split;
+  intros t' s' Hin;
+  repeat match goal with
+  | Hin : _ \/ _ |- _ => destruct Hin as [Hin | Hin]
+  | Hin : ?x = ?y |- _ => injection Hin; intros; lia
+  | Hin : False |- _ => contradiction
+  end.
+
+Ltac prove_thresholds_decreasing :=
+  simpl;
+  repeat split;
+  intros t' s' Hin;
+  repeat match goal with
+  | Hin : _ \/ _ |- _ => destruct Hin as [Hin | Hin]
+  | Hin : ?x = ?y |- _ => injection Hin; intros; lia
+  | Hin : False |- _ => contradiction
   end.
 
 (** Tactic to prove scores_decreasing for concrete threshold lists. *)
@@ -419,13 +640,25 @@ Proof.
   prove_scores_decreasing.
 Qed.
 
+Lemma resp_thresholds_increasing : thresholds_strictly_increasing resp_thresholds.
+Proof.
+  unfold resp_thresholds.
+  prove_thresholds_increasing.
+Qed.
+
+Lemma resp_thresholds_well_formed : well_formed_below_table resp_thresholds.
+Proof.
+  split.
+  - exact resp_thresholds_decreasing.
+  - exact resp_thresholds_increasing.
+Qed.
+
 (** P/F ratio calculation. FiO2 is given as percent (1-100), so the formula
     (pao2 * 100) / fio2_pct yields the standard P/F ratio. Integer division
     truncates; maximum error is < 1 unit (clinically negligible vs 100-unit
-    threshold granularity). *)
+    threshold granularity). Requires valid FiO2 >= 1; FiO2=0 yields 0. *)
 Definition pf_ratio (pao2_val fio2_val : nat) : nat :=
-  let fio2 := max1 fio2_val in
-  (pao2_val * 100) / fio2.
+  (pao2_val * 100) / fio2_val.
 
 Definition resp_score (v:Vitals) (t:Therapy) : nat :=
   let raw := resp_bucket (pf_ratio (pao2 v) (fio2_pct v)) in
@@ -454,6 +687,19 @@ Lemma coag_thresholds_decreasing : scores_decreasing coag_thresholds.
 Proof.
   unfold coag_thresholds.
   prove_scores_decreasing.
+Qed.
+
+Lemma coag_thresholds_increasing : thresholds_strictly_increasing coag_thresholds.
+Proof.
+  unfold coag_thresholds.
+  prove_thresholds_increasing.
+Qed.
+
+Lemma coag_thresholds_well_formed : well_formed_below_table coag_thresholds.
+Proof.
+  split.
+  - exact coag_thresholds_decreasing.
+  - exact coag_thresholds_increasing.
 Qed.
 
 Lemma coag_score_raw_mono : forall p1 p2, p2 <= p1 -> coag_score_raw p2 >= coag_score_raw p1.
@@ -525,6 +771,19 @@ Proof.
   prove_scores_decreasing.
 Qed.
 
+Lemma liver_thresholds_thresh_decreasing : thresholds_strictly_decreasing liver_thresholds.
+Proof.
+  unfold liver_thresholds.
+  prove_thresholds_decreasing.
+Qed.
+
+Lemma liver_thresholds_well_formed : well_formed_above_table liver_thresholds.
+Proof.
+  split.
+  - exact liver_thresholds_decreasing.
+  - exact liver_thresholds_thresh_decreasing.
+Qed.
+
 Lemma liver_score_raw_mono : forall b1 b2, b1 <= b2 -> liver_score_raw b2 >= liver_score_raw b1.
 Proof.
   intros b1 b2 Hb.
@@ -559,6 +818,19 @@ Proof.
   prove_scores_decreasing.
 Qed.
 
+Lemma cns_thresholds_increasing : thresholds_strictly_increasing cns_thresholds.
+Proof.
+  unfold cns_thresholds.
+  prove_thresholds_increasing.
+Qed.
+
+Lemma cns_thresholds_well_formed : well_formed_below_table cns_thresholds.
+Proof.
+  split.
+  - exact cns_thresholds_decreasing.
+  - exact cns_thresholds_increasing.
+Qed.
+
 Lemma cns_score_raw_mono : forall g1 g2, g2 <= g1 -> cns_score_raw g2 >= cns_score_raw g1.
 Proof.
   intros g1 g2 Hg.
@@ -568,15 +840,18 @@ Proof.
   - exact Hg.
 Qed.
 
+(** Creatinine scoring per SOFA renal criteria (mg/dL × 10):
+    <1.2 (12) → 0, 1.2-1.9 (12-19) → 1, 2.0-3.4 (20-34) → 2,
+    3.5-4.9 (35-49) → 3, ≥5.0 (50) → 4. *)
 Definition creat_score (c:nat) : nat :=
-  if ge_bool c 53 then 4
-  else if ge_bool c 34 then 3
-  else if ge_bool c 21 then 2
-  else if ge_bool c 11 then 1
+  if ge_bool c 50 then 4
+  else if ge_bool c 35 then 3
+  else if ge_bool c 20 then 2
+  else if ge_bool c 12 then 1
   else 0.
 
 Definition creat_thresholds : list (nat * nat) :=
-  (53, 4) :: (34, 3) :: (21, 2) :: (11, 1) :: nil.
+  (50, 4) :: (35, 3) :: (20, 2) :: (12, 1) :: nil.
 
 Lemma creat_score_eq : forall c, creat_score c = score_above_thresholds c creat_thresholds.
 Proof.
@@ -589,6 +864,19 @@ Lemma creat_thresholds_decreasing : scores_decreasing creat_thresholds.
 Proof.
   unfold creat_thresholds.
   prove_scores_decreasing.
+Qed.
+
+Lemma creat_thresholds_thresh_decreasing : thresholds_strictly_decreasing creat_thresholds.
+Proof.
+  unfold creat_thresholds.
+  prove_thresholds_decreasing.
+Qed.
+
+Lemma creat_thresholds_well_formed : well_formed_above_table creat_thresholds.
+Proof.
+  split.
+  - exact creat_thresholds_decreasing.
+  - exact creat_thresholds_thresh_decreasing.
 Qed.
 
 (** Urine output scoring per SOFA using 6-hour windows.
@@ -614,6 +902,19 @@ Lemma urine_thresholds_decreasing : scores_decreasing urine_thresholds.
 Proof.
   unfold urine_thresholds.
   prove_scores_decreasing.
+Qed.
+
+Lemma urine_thresholds_increasing : thresholds_strictly_increasing urine_thresholds.
+Proof.
+  unfold urine_thresholds.
+  prove_thresholds_increasing.
+Qed.
+
+Lemma urine_thresholds_well_formed : well_formed_below_table urine_thresholds.
+Proof.
+  split.
+  - exact urine_thresholds_decreasing.
+  - exact urine_thresholds_increasing.
 Qed.
 
 Definition renal_score (v:Vitals) : nat :=
@@ -681,33 +982,59 @@ Proof.
   reflexivity.
 Qed.
 
+(** Any vasopressor currently running. *)
+Definition any_pressor (t : Therapy) : bool :=
+  on_low_dose_pressor t || on_medium_dose_pressor t || on_high_dose_pressor t.
+
 (** Sepsis / shock predicates *)
 Definition sepsis (s:State) : bool :=
   infection (vit s) && ge_bool (sofa s) 2.
 
+(** Sepsis-3 septic shock: sepsis with vasopressor requirement to maintain
+    MAP ≥ 65 AND lactate > 2 mmol/L despite adequate fluid resuscitation. *)
 Definition septic_shock (s:State) : bool :=
   infection (vit s) &&
   ge_bool (sofa s) 2 &&
-  (map_mmhg (vit s) <? 65) &&
+  any_pressor (th s) &&
+  fluid_resuscitation_complete (vit s) (th s) &&
   (20 <? lact10 (vit s)).
+
+(** Sepsis-induced hypoperfusion: earlier stage before full shock criteria met.
+    Hypotension (MAP < 65) or elevated lactate (> 2 mmol/L) with infection. *)
+Definition sepsis_hypoperfusion (s:State) : bool :=
+  infection (vit s) &&
+  ge_bool (sofa s) 2 &&
+  ((map_mmhg (vit s) <? 65) || (20 <? lact10 (vit s))).
 
 (** Witness: patient meeting all septic shock criteria. *)
 Definition v_shock_witness : Vitals :=
   {| temp10 := 390; hr := 120; rr := 28; sbp := 80; map_mmhg := 60; lact10 := 25;
      gcs := 14; platelets := 80; bilir10 := 15; creat10 := 25; urine_ml_6hr := 30;
-     pao2 := 70; fio2_pct := 40; infection := true; weight_kg := 70 |}.
+     pao2 := 70; fio2_pct := 40; infection := true; weight_kg := 70;
+     infection_info := Confirmed SourcePulmonary |}.
+
+Definition t_shock_witness : Therapy :=
+  {| fluids_on := true; fluids_start_time := Some 0; fluids_ml := 2100;
+     antibiotics_on := true; abx_start_time := Some 0;
+     dopamine_mcg := 0; dobutamine_on := false;
+     norepinephrine_mcg := 15; epinephrine_mcg := 0;
+     on_vent := false; icu_transfer := false |}.
 
 Lemma septic_shock_witness_satisfies :
-  septic_shock (make_state v_shock_witness init_therapy) = true.
+  septic_shock (make_state v_shock_witness t_shock_witness) = true.
 Proof. reflexivity. Qed.
 
 Lemma septic_shock_witness_has_infection :
   infection v_shock_witness = true.
 Proof. reflexivity. Qed.
 
-Lemma septic_shock_witness_has_hypotension :
-  map_mmhg v_shock_witness < 65.
-Proof. simpl. lia. Qed.
+Lemma septic_shock_witness_has_vasopressor :
+  any_pressor t_shock_witness = true.
+Proof. reflexivity. Qed.
+
+Lemma septic_shock_witness_fluids_complete :
+  fluid_resuscitation_complete v_shock_witness t_shock_witness = true.
+Proof. reflexivity. Qed.
 
 Lemma septic_shock_witness_has_elevated_lactate :
   lact10 v_shock_witness > 20.
@@ -717,7 +1044,8 @@ Proof. simpl. lia. Qed.
 Definition v_not_septic : Vitals :=
   {| temp10 := 390; hr := 120; rr := 28; sbp := 80; map_mmhg := 60; lact10 := 25;
      gcs := 14; platelets := 80; bilir10 := 15; creat10 := 25; urine_ml_6hr := 30;
-     pao2 := 70; fio2_pct := 40; infection := false; weight_kg := 70 |}.
+     pao2 := 70; fio2_pct := 40; infection := false; weight_kg := 70;
+     infection_info := NoInfection |}.
 
 Lemma not_septic_despite_shock_physiology :
   septic_shock (make_state v_not_septic init_therapy) = false.
@@ -741,8 +1069,28 @@ Proof.
   unfold sepsis.
   apply andb_prop in Hshock as [H1 _].
   apply andb_prop in H1 as [H2 _].
-  apply andb_prop in H2 as [Hinf Hsofa].
+  apply andb_prop in H2 as [H3 _].
+  apply andb_prop in H3 as [Hinf Hsofa].
   rewrite Hinf, Hsofa.
+  reflexivity.
+Qed.
+
+Lemma septic_shock_implies_hypoperfusion :
+  forall s, septic_shock s = true -> sepsis_hypoperfusion s = true.
+Proof.
+  intros s Hshock.
+  unfold septic_shock in Hshock.
+  unfold sepsis_hypoperfusion.
+  apply andb_prop in Hshock as [H1 Hlact].
+  apply andb_prop in H1 as [H2 _].
+  apply andb_prop in H2 as [H3 _].
+  apply andb_prop in H3 as [Hinf Hsofa].
+  rewrite Hinf, Hsofa.
+  simpl.
+  apply Nat.ltb_lt in Hlact.
+  assert (Hlact' : 20 <? lact10 (vit s) = true) by (apply Nat.ltb_lt; lia).
+  rewrite Hlact'.
+  rewrite Bool.orb_true_r.
   reflexivity.
 Qed.
 
@@ -758,13 +1106,10 @@ Record Plan := {
 Definition plan_false : Plan :=
   {| p_fluids := false; p_antibiotics := false; p_pressor_lo := false; p_pressor_hi := false; p_icu := false |}.
 
-(** Helper: any vasopressor currently running. *)
-Definition any_pressor (t : Therapy) : bool :=
-  on_low_dose_pressor t || on_medium_dose_pressor t || on_high_dose_pressor t.
-
-(** Clinical indications based purely on vitals (independent of current therapy). *)
+(** Clinical indications based purely on vitals (independent of current therapy).
+    Per SSC Hour-1 bundle: fluids for hypotension (MAP ≤ 65) or lactate ≥ 4 mmol/L. *)
 Definition fluids_indicated (v : Vitals) : bool :=
-  (map_mmhg v <=? 65) || (20 <=? lact10 v).
+  (map_mmhg v <=? 65) || (40 <=? lact10 v).
 
 Definition antibiotics_indicated (v : Vitals) : bool :=
   infection v.
@@ -815,7 +1160,7 @@ Definition decide_plan (s:State) : Plan :=
      p_icu := icu |}.
 
 Lemma fluids_indicated_correct :
-  forall v, fluids_indicated v = true <-> map_mmhg v <= 65 \/ lact10 v >= 20.
+  forall v, fluids_indicated v = true <-> map_mmhg v <= 65 \/ lact10 v >= 40.
 Proof.
   intro v.
   unfold fluids_indicated.
@@ -854,6 +1199,65 @@ Proof.
   congruence.
 Qed.
 
+(** Plan internal consistency: escalation hierarchy is maintained. *)
+Lemma plan_icu_implies_pressor_hi :
+  forall s, p_icu (decide_plan s) = true -> p_pressor_hi (decide_plan s) = true.
+Proof.
+  intros s.
+  unfold decide_plan.
+  simpl.
+  set (v := vit s).
+  set (t := th s).
+  set (flu := fluids_indicated v || fluids_on t).
+  set (plo := (pressor_indicated v && flu) || any_pressor t).
+  set (phi := (icu_indicated v && plo) || on_medium_dose_pressor t || on_high_dose_pressor t).
+  set (icu := (icu_indicated v && phi) || on_high_dose_pressor t).
+  intro Hicu.
+  unfold icu in Hicu.
+  apply Bool.orb_true_iff in Hicu.
+  destruct Hicu as [Hcond | Hhi].
+  - apply andb_prop in Hcond as [_ Hphi].
+    exact Hphi.
+  - unfold phi.
+    rewrite Hhi.
+    rewrite !Bool.orb_true_r.
+    reflexivity.
+Qed.
+
+Lemma plan_pressor_hi_implies_pressor_lo :
+  forall s, p_pressor_hi (decide_plan s) = true -> p_pressor_lo (decide_plan s) = true.
+Proof.
+  intros s.
+  unfold decide_plan.
+  simpl.
+  set (v := vit s).
+  set (t := th s).
+  set (flu := fluids_indicated v || fluids_on t).
+  set (plo := (pressor_indicated v && flu) || any_pressor t).
+  set (phi := (icu_indicated v && plo) || on_medium_dose_pressor t || on_high_dose_pressor t).
+  intro Hphi.
+  unfold phi in Hphi.
+  apply Bool.orb_true_iff in Hphi.
+  destruct Hphi as [Hphi' | Hhi].
+  - apply Bool.orb_true_iff in Hphi'.
+    destruct Hphi' as [Hcond | Hmed].
+    + apply andb_prop in Hcond as [_ Hplo].
+      exact Hplo.
+    + unfold plo. unfold any_pressor.
+      rewrite Hmed. rewrite Bool.orb_true_r.
+      apply Bool.orb_true_iff. right.
+      apply Bool.orb_true_iff. left.
+      reflexivity.
+  - unfold plo. unfold any_pressor.
+    rewrite Hhi.
+    rewrite !Bool.orb_true_r.
+    reflexivity.
+Qed.
+
+(** Note: plan_pressor_lo does NOT imply plan_fluids because pressors can already
+    be running (any_pressor t = true) without fluids being indicated or on.
+    The escalation hierarchy only guarantees ICU -> pressor_hi -> pressor_lo. *)
+
 (** Monotonicity of SOFA with worsening inputs *)
 Definition worse_or_equal (v w : Vitals) : Prop :=
   temp10 w >= temp10 v /\
@@ -879,36 +1283,32 @@ Proof.
   - exact Hr.
 Qed.
 
-Lemma resp_score_mono : forall v w t, worse_or_equal v w -> resp_score w t >= resp_score v t.
+Lemma resp_score_mono : forall v w t,
+  vitals_valid v = true -> vitals_valid w = true ->
+  worse_or_equal v w -> resp_score w t >= resp_score v t.
 Proof.
-  intros v w t Hw.
+  intros v w t Hvalv Hvalw Hw.
+  pose proof (vitals_valid_fio2_bounds v Hvalv) as [Hfio2v_lo Hfio2v_hi].
+  pose proof (vitals_valid_fio2_bounds w Hvalw) as [Hfio2w_lo Hfio2w_hi].
   unfold worse_or_equal in Hw.
   destruct Hw as [Htemp [Hhr [Hrr [Hsbp [Hmap [Hlact [Hgcs [Hplt [Hbil [Hcre [Hur [Hpao2 Hfio2]]]]]]]]]]]].
   unfold resp_score, pf_ratio.
-  set (d1 := max1 (fio2_pct v)).
-  set (d2 := max1 (fio2_pct w)).
-  assert (Hd1pos : d1 > 0) by (unfold d1, max1; destruct (fio2_pct v); simpl; lia).
-  assert (Hd1le : d1 <= d2).
-  { unfold d1, d2, max1 in *.
-    destruct (fio2_pct v) eqn:Hv; destruct (fio2_pct w) eqn:Hw'; simpl in *; lia. }
+  set (d1 := fio2_pct v).
+  set (d2 := fio2_pct w).
+  assert (Hd1pos : d1 > 0) by (unfold d1; lia).
+  assert (Hd2pos : d2 > 0) by (unfold d2; lia).
+  assert (Hd1le : d1 <= d2) by (unfold d1, d2; lia).
   set (r1 := (pao2 v * 100) / d1).
   set (r2 := (pao2 w * 100) / d2).
-  assert (Hd1nz : d1 <> 0) by lia.
   assert (Hstep1 : r2 <= (pao2 w * 100) / d1).
-  { unfold r2.
-    apply Nat.div_le_compat_l.
-    lia. }
+  { unfold r2. apply Nat.div_le_compat_l. lia. }
   assert (Hstep2 : (pao2 w * 100) / d1 <= r1).
-  { unfold r1.
-    apply Nat.Div0.div_le_mono.
-    lia. }
+  { unfold r1. apply Nat.Div0.div_le_mono. lia. }
   assert (Hbucket : resp_bucket r2 >= resp_bucket r1).
-  { apply resp_bucket_mono.
-    lia. }
+  { apply resp_bucket_mono. lia. }
   destruct (on_vent t).
   - exact Hbucket.
-  - apply Nat.min_le_compat_r.
-    exact Hbucket.
+  - apply Nat.min_le_compat_r. exact Hbucket.
 Qed.
 
 Lemma coag_score_mono : forall v w, worse_or_equal v w -> coag_score w >= coag_score v.
@@ -995,10 +1395,12 @@ Proof.
               lia.
 Qed.
 
-Lemma sofa_monotone : forall v w t, worse_or_equal v w -> sofa (make_state w t) >= sofa (make_state v t).
+Lemma sofa_monotone : forall v w t,
+  vitals_valid v = true -> vitals_valid w = true ->
+  worse_or_equal v w -> sofa (make_state w t) >= sofa (make_state v t).
 Proof.
-  intros v w t Hw; unfold sofa, make_state; simpl.
-  pose proof (@resp_score_mono v w t Hw) as Hr1.
+  intros v w t Hvalv Hvalw Hw; unfold sofa, make_state; simpl.
+  pose proof (@resp_score_mono v w t Hvalv Hvalw Hw) as Hr1.
   pose proof (coag_score_mono (v:=v) (w:=w) Hw) as Hr2.
   pose proof (liver_score_mono (v:=v) (w:=w) Hw) as Hr3.
   pose proof (cns_score_mono (v:=v) (w:=w) Hw) as Hr4.
@@ -1190,7 +1592,7 @@ Proof.
 Qed.
 
 Lemma plan_fluids_if_hypotension_or_lactate :
-  forall s, (map_mmhg (vit s) <= 65 \/ lact10 (vit s) >= 20) -> p_fluids (decide_plan s) = true.
+  forall s, (map_mmhg (vit s) <= 65 \/ lact10 (vit s) >= 40) -> p_fluids (decide_plan s) = true.
 Proof.
   intros s Hind.
   unfold decide_plan.
@@ -1206,16 +1608,39 @@ Lemma plan_escalates_on_shock :
 Proof.
   intros s Hshock.
   unfold septic_shock in Hshock.
-  apply andb_prop in Hshock as [Hinf Hlac20].
-  apply andb_prop in Hinf as [Hinf Hmap].
-  apply andb_prop in Hinf as [Hinf Hsofa].
-  apply Nat.ltb_lt in Hmap.
-  unfold decide_plan, pressor_indicated, fluids_indicated.
+  apply andb_prop in Hshock as [H1 _].
+  apply andb_prop in H1 as [H2 _].
+  apply andb_prop in H2 as [H3 Hpressor].
+  unfold decide_plan.
   simpl.
-  assert (Hle : map_mmhg (vit s) <=? 65 = true) by (apply Nat.leb_le; lia).
-  rewrite Hle.
-  simpl.
+  rewrite Hpressor.
+  rewrite !Bool.orb_true_r.
   reflexivity.
+Qed.
+
+(** Hypotensive hypoperfusion triggers fluids. *)
+Lemma plan_fluids_if_hypotensive_hypoperfusion :
+  forall s, sepsis_hypoperfusion s = true -> map_mmhg (vit s) < 65 -> p_fluids (decide_plan s) = true.
+Proof.
+  intros s Hhypo Hmap.
+  unfold decide_plan.
+  simpl.
+  unfold fluids_indicated.
+  assert (Hle : map_mmhg (vit s) <=? 65 = true) by (apply Nat.leb_le; lia).
+  rewrite Hle. reflexivity.
+Qed.
+
+(** High lactate (≥ 4 mmol/L) hypoperfusion triggers fluids per SSC bundle. *)
+Lemma plan_fluids_if_high_lactate :
+  forall s, lact10 (vit s) >= 40 -> p_fluids (decide_plan s) = true.
+Proof.
+  intros s Hlact.
+  unfold decide_plan.
+  simpl.
+  unfold fluids_indicated.
+  assert (Hle : 40 <=? lact10 (vit s) = true) by (apply Nat.leb_le; lia).
+  rewrite Hle.
+  destruct (map_mmhg (vit s) <=? 65); reflexivity.
 Qed.
 
 Lemma high_pressor_implies_icu :
@@ -1250,12 +1675,14 @@ Qed.
 Definition v_norm : Vitals :=
   {| temp10 := 370; hr := 72; rr := 14; sbp := 120; map_mmhg := 85; lact10 := 12;
      gcs := 15; platelets := 250; bilir10 := 8; creat10 := 10; urine_ml_6hr := 300;
-     pao2 := 90; fio2_pct := 21; infection := false; weight_kg := 70 |}.
+     pao2 := 90; fio2_pct := 21; infection := false; weight_kg := 70;
+     infection_info := NoInfection |}.
 
 Definition v_shock : Vitals :=
   {| temp10 := 392; hr := 140; rr := 32; sbp := 85; map_mmhg := 55; lact10 := 45;
      gcs := 13; platelets := 90; bilir10 := 25; creat10 := 40; urine_ml_6hr := 30;
-     pao2 := 60; fio2_pct := 50; infection := true; weight_kg := 70 |}.
+     pao2 := 60; fio2_pct := 50; infection := true; weight_kg := 70;
+     infection_info := Confirmed SourcePulmonary |}.
 
 Definition s_norm : State := make_state v_norm init_therapy.
 Definition s_shock : State := make_state v_shock init_therapy.
@@ -1306,22 +1733,26 @@ Proof. reflexivity. Qed.
 Definition v_boundary_map65 : Vitals :=
   {| temp10 := 370; hr := 80; rr := 18; sbp := 100; map_mmhg := 65; lact10 := 15;
      gcs := 15; platelets := 200; bilir10 := 10; creat10 := 12; urine_ml_6hr := 200;
-     pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70 |}.
+     pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70;
+     infection_info := Suspected SourceUnknown |}.
 
 Definition v_boundary_map64 : Vitals :=
   {| temp10 := 370; hr := 80; rr := 18; sbp := 100; map_mmhg := 64; lact10 := 15;
      gcs := 15; platelets := 200; bilir10 := 10; creat10 := 12; urine_ml_6hr := 200;
-     pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70 |}.
+     pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70;
+     infection_info := Suspected SourceUnknown |}.
 
 Definition v_boundary_lact20 : Vitals :=
   {| temp10 := 370; hr := 80; rr := 18; sbp := 100; map_mmhg := 70; lact10 := 20;
      gcs := 15; platelets := 200; bilir10 := 10; creat10 := 12; urine_ml_6hr := 200;
-     pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70 |}.
+     pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70;
+     infection_info := Suspected SourceUnknown |}.
 
 Definition v_boundary_lact21 : Vitals :=
   {| temp10 := 370; hr := 80; rr := 18; sbp := 100; map_mmhg := 70; lact10 := 21;
      gcs := 15; platelets := 200; bilir10 := 10; creat10 := 12; urine_ml_6hr := 200;
-     pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70 |}.
+     pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70;
+     infection_info := Suspected SourceUnknown |}.
 
 Example boundary_map65_fluids_indicated :
   fluids_indicated v_boundary_map65 = true.
@@ -1339,27 +1770,44 @@ Example boundary_lact20_not_septic_shock :
   septic_shock (make_state v_boundary_lact20 init_therapy) = false.
 Proof. reflexivity. Qed.
 
-Example boundary_lact21_with_hypotension :
+Example boundary_lact21_with_hypotension_hypoperfusion :
   let v := {| temp10 := 370; hr := 80; rr := 18; sbp := 100; map_mmhg := 64; lact10 := 21;
               gcs := 15; platelets := 200; bilir10 := 10; creat10 := 12; urine_ml_6hr := 200;
-              pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70 |} in
-  septic_shock (make_state v init_therapy) = true.
+              pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70;
+              infection_info := Suspected SourceUnknown |} in
+  sepsis_hypoperfusion (make_state v init_therapy) = true.
+Proof. reflexivity. Qed.
+
+Example boundary_lact21_with_hypotension_needs_therapy_for_shock :
+  let v := {| temp10 := 370; hr := 80; rr := 18; sbp := 100; map_mmhg := 64; lact10 := 21;
+              gcs := 15; platelets := 200; bilir10 := 10; creat10 := 12; urine_ml_6hr := 200;
+              pao2 := 80; fio2_pct := 21; infection := true; weight_kg := 70;
+              infection_info := Suspected SourceUnknown |} in
+  let t := {| fluids_on := true; fluids_start_time := Some 0; fluids_ml := 2100;
+              antibiotics_on := true; abx_start_time := Some 0;
+              dopamine_mcg := 0; dobutamine_on := false;
+              norepinephrine_mcg := 15; epinephrine_mcg := 0;
+              on_vent := false; icu_transfer := false |} in
+  septic_shock (make_state v t) = true.
 Proof. reflexivity. Qed.
 
 Definition v_news_low : Vitals :=
   {| temp10 := 370; hr := 80; rr := 16; sbp := 120; map_mmhg := 80; lact10 := 10;
      gcs := 15; platelets := 200; bilir10 := 10; creat10 := 10; urine_ml_6hr := 300;
-     pao2 := 95; fio2_pct := 21; infection := false; weight_kg := 70 |}.
+     pao2 := 95; fio2_pct := 21; infection := false; weight_kg := 70;
+     infection_info := NoInfection |}.
 
 Definition v_news_medium : Vitals :=
   {| temp10 := 385; hr := 100; rr := 22; sbp := 105; map_mmhg := 75; lact10 := 15;
      gcs := 15; platelets := 200; bilir10 := 10; creat10 := 10; urine_ml_6hr := 300;
-     pao2 := 90; fio2_pct := 21; infection := false; weight_kg := 70 |}.
+     pao2 := 90; fio2_pct := 21; infection := false; weight_kg := 70;
+     infection_info := NoInfection |}.
 
 Definition v_news_high : Vitals :=
   {| temp10 := 395; hr := 115; rr := 26; sbp := 95; map_mmhg := 65; lact10 := 18;
      gcs := 14; platelets := 200; bilir10 := 10; creat10 := 10; urine_ml_6hr := 300;
-     pao2 := 85; fio2_pct := 21; infection := true; weight_kg := 70 |}.
+     pao2 := 85; fio2_pct := 21; infection := true; weight_kg := 70;
+     infection_info := Suspected SourceUnknown |}.
 
 Example news_low_score : news v_news_low = 0.
 Proof. reflexivity. Qed.
